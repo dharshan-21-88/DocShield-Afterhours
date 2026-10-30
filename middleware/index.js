@@ -159,3 +159,37 @@ export function errorHandler(err, _req, res, _next) {
     message: err.message || 'An unexpected error occurred while processing the request.',
   });
 }
+
+
+// Image upload middleware for PNG/JPEG screenshots and photos.
+// Images are converted to a temporary PDF before entering the same OCR/redaction pipeline.
+const imageUpload = multer({
+  storage: multer.memoryStorage(),
+  limits: { fileSize: config.upload.maxFileSizeBytes, files: 1 },
+  fileFilter: (_req, file, cb) => {
+    const allowed = ['image/png', 'image/jpeg'];
+    if (!allowed.includes(file.mimetype)) {
+      const error = new Error('Please upload a PNG or JPEG image.');
+      error.code = 'INVALID_IMAGE_TYPE';
+      return cb(error, false);
+    }
+    cb(null, true);
+  },
+});
+
+export function uploadImageMiddleware(req, res, next) {
+  imageUpload.single('file')(req, res, (err) => {
+    if (err) {
+      const status = err instanceof multer.MulterError && err.code === 'LIMIT_FILE_SIZE' ? 413 : 400;
+      return res.status(status).json({
+        success: false,
+        error: err.code || 'IMAGE_UPLOAD_ERROR',
+        message: err.message || 'Unable to upload image.',
+      });
+    }
+    if (!req.file) {
+      return res.status(400).json({ success: false, error: 'MISSING_FILE', message: 'Choose a PNG or JPEG image.' });
+    }
+    next();
+  });
+}
