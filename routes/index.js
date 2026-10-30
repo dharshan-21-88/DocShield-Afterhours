@@ -1,8 +1,9 @@
 import { Router } from 'express';
-import { uploadPdfMiddleware } from '../middleware/index.js';
+import { uploadPdfMiddleware, uploadImageMiddleware } from '../middleware/index.js';
 import {
   getHealth,
   uploadPdfController,
+  uploadImageController,
   listSamplesController,
   loadSampleController,
   detectSensitiveController,
@@ -23,6 +24,8 @@ router.post('/samples/:sampleId/load', loadSampleController);
 
 // 3. Upload PDF & extract text (with OCR fallback)
 router.post('/upload', uploadPdfMiddleware, uploadPdfController);
+
+router.post('/upload-image', uploadImageMiddleware, uploadImageController);
 
 // 4. Detect sensitive information
 router.post('/detect', detectSensitiveController);
