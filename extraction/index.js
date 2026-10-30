@@ -217,9 +217,227 @@ function extractOcrElementsFromData(ocrData, ocrScale) {
 }
 
 /**
+ * Convert a PDF bottom-left annotation rectangle `[x1, y1, x2, y2]` into a validated
+ * 1.0x top-left PDF point bounding box `{ x, y, width, height }` using `viewport.convertToViewportPoint`.
+ *
+ * Returns `null` if the annotation lacks a finite, positive-area rectangle within the visible page viewport.
+ */
+function convertAndValidateAnnotationRect(rect, viewport) {
+  if (!Array.isArray(rect) || rect.length !== 4) return null;
+  const nums = rect.map(Number);
+  if (nums.some((n) => !Number.isFinite(n))) return null;
+
+  const [p1x, p1y] = viewport.convertToViewportPoint(nums[0], nums[1]);
+  const [p2x, p2y] = viewport.convertToViewportPoint(nums[2], nums[3]);
+
+  const rawX = Math.min(p1x, p2x);
+  const rawY = Math.min(p1y, p2y);
+  const rawMaxX = Math.max(p1x, p2x);
+  const rawMaxY = Math.max(p1y, p2y);
+  const rawW = rawMaxX - rawX;
+  const rawH = rawMaxY - rawY;
+
+  if (rawW < 2 || rawH < 2) return null;
+
+  const pageWidth = viewport.width;
+  const pageHeight = viewport.height;
+
+  // Reject rectangles that lie completely outside the visible page bounds
+  if (rawMaxX <= 0 || rawMaxY <= 0 || rawX >= pageWidth || rawY >= pageHeight) {
+    return null;
+  }
+
+  const clampedX = Math.max(0, rawX);
+  const clampedY = Math.max(0, rawY);
+  const clampedW = Math.min(pageWidth - clampedX, rawMaxX - clampedX);
+  const clampedH = Math.min(pageHeight - clampedY, rawMaxY - clampedY);
+
+  if (clampedW < 2 || clampedH < 2) return null;
+
+  return {
+    x: Number(clampedX.toFixed(2)),
+    y: Number(clampedY.toFixed(2)),
+    width: Number(clampedW.toFixed(2)),
+    height: Number(clampedH.toFixed(2)),
+  };
+}
+
+/**
+ * Extract human-readable text strings from a PDF.js annotation or AcroForm widget.
+ */
+function extractTextFromAnnotationObject(ann) {
+  const parts = [];
+
+  if (ann.subtype === 'Widget') {
+    const rawVal = ann.fieldValue ?? ann.defaultFieldValue;
+    if (Array.isArray(rawVal)) {
+      parts.push(rawVal.filter(Boolean).map(String).join(' '));
+    } else if (typeof rawVal === 'string' && rawVal.trim()) {
+      parts.push(rawVal.trim());
+    } else if (typeof rawVal === 'number') {
+      parts.push(String(rawVal));
+    }
+  }
+
+  if (Array.isArray(ann.textContent) && ann.textContent.length > 0) {
+    const joinedTextContent = ann.textContent.map((s) => (s || '').trim()).filter(Boolean).join(' ');
+    if (joinedTextContent) {
+      parts.push(joinedTextContent);
+    }
+  }
+
+  if (typeof ann.contentsObj?.str === 'string' && ann.contentsObj.str.trim()) {
+    parts.push(ann.contentsObj.str.trim());
+  } else if (typeof ann.contents === 'string' && ann.contents.trim()) {
+    parts.push(ann.contents.trim());
+  }
+
+  // Deduplicate identical strings (e.g. when both fieldValue and textContent hold "ABCDE1234F")
+  const unique = [];
+  const seen = new Set();
+  for (const p of parts) {
+    const norm = p.replace(/\s+/g, ' ').trim();
+    const lower = norm.toLowerCase();
+    if (norm && !seen.has(lower)) {
+      seen.add(lower);
+      unique.push(norm);
+    }
+  }
+
+  return unique.join(' ');
+}
+
+/**
+ * Inspect `page.getAnnotations()` on a PDF.js page to:
+ * 1. Extract visible AcroForm widgets (`Tx`, `Ch`) and visual text annotations (`FreeText`, custom appearance streams)
+ *    with validated page bounding boxes (`source: 'pdf-annotation'`).
+ * 2. Record non-visual / unlocatable annotations (`Text` sticky notes, `Popup`, zero-area/off-page rects, or
+ *    `FreeText` without appearance streams) so any sensitive text inside them is never given a fabricated box
+ *    and is surfaced with an explicit warning.
+ * 3. Record `Link` / URI annotations as structural metadata rather than visible page text.
+ */
+async function extractPageAnnotations(page, viewport, pageNum) {
+  let rawAnnotations = [];
+  try {
+    rawAnnotations = (await page.getAnnotations()) || [];
+  } catch {
+    return {
+      visualAnnotationElements: [],
+      visualAnnotationTexts: [],
+      unlocatableAnnotationTexts: [],
+      unsupportedAnnotations: [],
+      linkAnnotations: [],
+    };
+  }
+
+  const visualAnnotationElements = [];
+  const visualAnnotationTexts = [];
+  const unlocatableAnnotationTexts = [];
+  const unsupportedAnnotations = [];
+  const linkAnnotations = [];
+
+  for (const ann of rawAnnotations) {
+    const subtype = ann?.subtype || 'Unknown';
+    const annotFlags = Number(ann?.annotationFlags || 0);
+    // PDF 32000-1 Table 165: bit 1 (value 1) = Invisible, bit 2 (value 2) = Hidden, bit 6 (value 32) = NoView
+    const isHiddenByFlags = Boolean(ann?.hidden) || (annotFlags & 1) !== 0 || (annotFlags & 2) !== 0 || (annotFlags & 32) !== 0;
+
+    // 1. Structural Link / URI annotations: record structurally, never treat as visible text requiring a black rectangle
+    if (subtype === 'Link') {
+      const targetUrl = ann.url || ann.unsafeUrl || null;
+      if (targetUrl) {
+        linkAnnotations.push({
+          id: ann.id || null,
+          pageNumber: pageNum,
+          subtype: 'Link',
+          url: targetUrl,
+          rect: Array.isArray(ann.rect) ? ann.rect : null,
+        });
+      }
+      continue;
+    }
+
+    const extractedText = extractTextFromAnnotationObject(ann);
+    if (!extractedText) continue;
+
+    // Ignore purely boolean/off checkbox states ('Off') on non-text button widgets
+    if (subtype === 'Widget' && ann.fieldType === 'Btn' && extractedText.toLowerCase() === 'off') {
+      continue;
+    }
+
+    const validatedBox = convertAndValidateAnnotationRect(ann.rect, viewport);
+
+    // Determine whether PDF.js `page.render()` actually renders this annotation visually on the page canvas
+    const isSupportedFormWidget =
+      subtype === 'Widget' &&
+      (ann.fieldType === 'Tx' || ann.fieldType === 'Ch' || Boolean(ann.fieldValue) || Boolean(ann.defaultFieldValue));
+    const isVisualFreeText = subtype === 'FreeText' && Boolean(ann.hasAppearance);
+    const isOtherVisualAppearance =
+      subtype !== 'Text' &&
+      subtype !== 'Popup' &&
+      Boolean(ann.hasAppearance) &&
+      Array.isArray(ann.textContent) &&
+      ann.textContent.length > 0;
+
+    const isVisuallyRendered = !isHiddenByFlags && (isSupportedFormWidget || isVisualFreeText || isOtherVisualAppearance);
+
+    if (isVisuallyRendered && validatedBox) {
+      visualAnnotationElements.push({
+        text: extractedText,
+        x: validatedBox.x,
+        y: validatedBox.y,
+        width: validatedBox.width,
+        height: validatedBox.height,
+        source: 'pdf-annotation',
+        annotationSubtype: subtype,
+        fieldType: ann.fieldType || null,
+        fieldName: ann.fieldName || null,
+         fullRectCover: true,
+      });
+      visualAnnotationTexts.push(extractedText);
+    } else {
+      // Do NOT invent a bounding box for non-visual sticky notes, hidden annotations, FreeText without /AP,
+      // or annotations with missing/zero-area/off-page rectangles.
+      let reason = `Annotation of subtype "${subtype}" does not have a visually rendered appearance stream or reliable page coordinates.`;
+      if (!validatedBox) {
+        reason = `Annotation of subtype "${subtype}" has missing, zero-area, or off-page rectangle coordinates (${JSON.stringify(ann.rect || null)}).`;
+      } else if (isHiddenByFlags) {
+        reason = `Annotation of subtype "${subtype}" is marked hidden/invisible by PDF annotation flags.`;
+      } else if (subtype === 'Text' || subtype === 'Popup') {
+        reason = `Sticky-note / popup annotation ("${subtype}") stores text in metadata popups rather than a reliable on-page text bounding box.`;
+      } else if (subtype === 'FreeText' && !ann.hasAppearance) {
+        reason = `FreeText annotation lacks an embedded normal appearance stream (/AP /N) and is not rendered onto the page canvas by PDF.js.`;
+      }
+
+      unlocatableAnnotationTexts.push(extractedText);
+      unsupportedAnnotations.push({
+        id: ann.id || null,
+        pageNumber: pageNum,
+        subtype,
+        fieldType: ann.fieldType || null,
+        fieldName: ann.fieldName || null,
+        hasAppearance: Boolean(ann.hasAppearance),
+        hasValidRect: Boolean(validatedBox),
+        status: 'UNSUPPORTED_ANNOTATION_COORDINATES',
+        reason,
+      });
+    }
+  }
+
+  return {
+    visualAnnotationElements,
+    visualAnnotationTexts,
+    unlocatableAnnotationTexts,
+    unsupportedAnnotations,
+    linkAnnotations,
+  };
+}
+
+/**
  * Extract embedded text and bounding-box items from a PDF file.
  * Automatically falls back to Tesseract.js OCR for any page that has little/no embedded text,
  * AND runs hybrid OCR inspection on pages that contain both selectable text and embedded raster images.
+ * Also inspects AcroForm widgets and visual annotations via `page.getAnnotations()`.
  *
  * @param {string} filePath - Path to the PDF file on disk
  * @param {object} options - { forceOcr: boolean }
@@ -263,6 +481,8 @@ export async function extractPdfContent(filePath, options = {}) {
   }
 
   const pages = [];
+  const allUnsupportedAnnotations = [];
+  const allLinkAnnotations = [];
   let usedOcrFallback = false;
   let usedPdfText = false;
   let ocrWorker = null;
@@ -279,6 +499,18 @@ export async function extractPdfContent(filePath, options = {}) {
 
       // Inspect PDF page operator list for embedded raster images
       const { hasEmbeddedImages, imageOperatorCount } = await detectEmbeddedImagesOnPage(page);
+
+      // Inspect AcroForm widgets and page annotations
+      const {
+        visualAnnotationElements,
+        visualAnnotationTexts,
+        unlocatableAnnotationTexts,
+        unsupportedAnnotations,
+        linkAnnotations,
+      } = await extractPageAnnotations(page, viewport, pageNum);
+
+      allUnsupportedAnnotations.push(...unsupportedAnnotations);
+      allLinkAnnotations.push(...linkAnnotations);
 
       // Convert PDF.js text items into normalized top-left coordinate items (PDF points)
       const textElements = [];
@@ -311,16 +543,24 @@ export async function extractPdfContent(filePath, options = {}) {
         textLines.push(item.str);
       }
 
-      const joinedPdfText = textLines.join(' ').replace(/\s+/g, ' ').trim();
-      const hasSubstantialText = joinedPdfText.length >= 15;
+      // Append validated visual AcroForm widget and visual annotation elements into textElements/textLines
+      for (const annEl of visualAnnotationElements) {
+        textElements.push(annEl);
+      }
+      for (const annTxt of visualAnnotationTexts) {
+        textLines.push(annTxt);
+      }
+
+      const joinedSelectableAndWidgetText = textLines.join(' ').replace(/\s+/g, ' ').trim();
+      const hasSubstantialText = joinedSelectableAndWidgetText.length >= 15;
       let pageMethod = 'pdf-text';
-      let finalPageText = joinedPdfText;
+      let finalPageText = joinedSelectableAndWidgetText;
       let finalElements = textElements;
 
       // Trigger OCR when:
       // 1. `forceOcr` is requested (e.g., during post-redaction verification), OR
-      // 2. The page has fewer than 15 characters of selectable text (`ocr-fallback`), OR
-      // 3. The page has selectable text AND embedded raster images (`hybrid`).
+      // 2. The page has fewer than 15 characters of selectable/widget text (`ocr-fallback`), OR
+      // 3. The page has selectable/widget text AND embedded raster images (`hybrid`).
       if (forceOcr || !hasSubstantialText || hasEmbeddedImages) {
         usedOcrFallback = true;
         pageMethod = !hasSubstantialText ? 'ocr-fallback' : 'hybrid';
@@ -357,7 +597,7 @@ export async function extractPdfContent(filePath, options = {}) {
           finalPageText = ocrText;
           finalElements = ocrElements;
         } else {
-          // Hybrid page: merge selectable PDF text with non-duplicate OCR elements originating from embedded images
+          // Hybrid page: merge selectable/widget PDF text with non-duplicate OCR elements originating from embedded images
           usedPdfText = true;
           const uniqueOcrElements = ocrElements.filter(
             (ocrEl) => !isOcrElementDuplicatingPdfText(ocrEl, textElements)
@@ -377,12 +617,23 @@ export async function extractPdfContent(filePath, options = {}) {
                   .join(' ');
 
           finalPageText = supplementalOcrText
-            ? `${joinedPdfText}\n${supplementalOcrText}`.trim()
-            : joinedPdfText;
+            ? `${joinedSelectableAndWidgetText}\n${supplementalOcrText}`.trim()
+            : joinedSelectableAndWidgetText;
           finalElements = [...textElements, ...uniqueOcrElements];
         }
       } else {
         usedPdfText = true;
+      }
+
+      // If the page also contains unlocatable/non-visual annotations (e.g., sticky notes or annotations with invalid/missing rect),
+      // append their text to `finalPageText` WITHOUT adding any element to `finalElements`.
+      // That way, `detectSensitiveInfo()` will detect any PII inside them with `boundingBox: null` (never inventing coordinates)
+      // and surface an explicit unlocatable-annotation status, preventing silent false-success redaction.
+      if (unlocatableAnnotationTexts.length > 0) {
+        const unlocText = unlocatableAnnotationTexts.join('\n').trim();
+        if (unlocText) {
+          finalPageText = finalPageText ? `${finalPageText}\n${unlocText}` : unlocText;
+        }
       }
 
       pages.push({
@@ -392,6 +643,9 @@ export async function extractPdfContent(filePath, options = {}) {
         method: pageMethod,
         hasEmbeddedImages,
         imageOperatorCount,
+        annotationCount: visualAnnotationElements.length + unsupportedAnnotations.length,
+        unsupportedAnnotations,
+        linkAnnotations,
         text: finalPageText,
         elements: finalElements,
       });
@@ -419,6 +673,8 @@ export async function extractPdfContent(filePath, options = {}) {
     extractionMethod,
     usedOcrFallback,
     totalCharacters,
+    unsupportedAnnotations: allUnsupportedAnnotations,
+    linkAnnotations: allLinkAnnotations,
     pages,
   };
 }

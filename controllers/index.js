@@ -71,6 +71,12 @@ async function processUploadedPdfFile(filePath, originalName, fileSizeBytes) {
         extractionMethod: extraction.extractionMethod,
         usedOcrFallback: extraction.usedOcrFallback,
         totalCharacters: extraction.totalCharacters,
+        ...(Array.isArray(extraction.unsupportedAnnotations) && extraction.unsupportedAnnotations.length > 0
+          ? { unsupportedAnnotations: extraction.unsupportedAnnotations }
+          : {}),
+        ...(Array.isArray(extraction.linkAnnotations) && extraction.linkAnnotations.length > 0
+          ? { linkAnnotations: extraction.linkAnnotations }
+          : {}),
         pages: extraction.pages.map((p) => ({
           pageNumber: p.pageNumber,
           width: p.width,
@@ -173,6 +179,8 @@ export async function detectSensitiveController(req, res, next) {
       categoryBreakdown: detectionResult.categoryBreakdown,
       disclaimer: detectionResult.disclaimer,
       items: detectionResult.items,
+      ...(detectionResult.unsupportedAnnotations ? { unsupportedAnnotations: detectionResult.unsupportedAnnotations } : {}),
+      ...(detectionResult.linkAnnotations ? { linkAnnotations: detectionResult.linkAnnotations } : {}),
     });
   } catch (err) {
     next(err);

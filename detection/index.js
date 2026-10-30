@@ -229,6 +229,18 @@ function buildLineBoxesFromElements(elements, pageWidth) {
  * for a substring [startCharIdx, startCharIdx + subLength].
  */
 function buildSubBoxInLineElement(el, startCharIdx, subLength, pageWidth) {
+  if (el.fullRectCover || el.source === 'pdf-annotation') {
+    const boxX = Math.max(0, el.x);
+    const boxW = Math.min(pageWidth - boxX, el.width);
+    return {
+      x: Number(boxX.toFixed(2)),
+      y: Number(Math.max(0, el.y).toFixed(2)),
+      width: Number(boxW.toFixed(2)),
+      height: Number(el.height.toFixed(2)),
+      coordinateSpace: 'pdf-top-left-points',
+    };
+  }
+
   const elText = (el.text || '').replace(/\s+/g, ' ').trim();
   const totalLen = Math.max(elText.length, 1);
   const ratioStart = Math.max(0, startCharIdx / totalLen);
@@ -562,6 +574,7 @@ export function detectSensitiveInfo(extractionResult, allowedCategories = null, 
     const resolvedCandidates = resolveOverlappingCandidates(rawCandidates, pageText);
 
     // 3. Map each resolved detection to its PDF page bounding box(es)
+    const pageUnsupportedAnns = page.unsupportedAnnotations || [];
     for (const cand of resolvedCandidates) {
       const { text: matchedText, pattern } = cand;
       const boxResult = findBoundingBoxForMatch(matchedText, page, usedBoxKeys);
@@ -569,9 +582,14 @@ export function detectSensitiveInfo(extractionResult, allowedCategories = null, 
       const boundingBoxes = boxResult ? boxResult.boundingBoxes : null;
 
       const confidence = boundingBox ? pattern.confidence : 'LOW_UNCERTAIN';
-      const detectionStatus = boundingBox
-        ? pattern.statusNote
-        : `${pattern.statusNote} (coordinates could not be established on page)`;
+      let detectionStatus = pattern.statusNote;
+      if (!boundingBox) {
+        if (pageUnsupportedAnns.length > 0) {
+          detectionStatus = `${pattern.statusNote} (UNSUPPORTED_ANNOTATION_COORDINATES: detected inside an annotation without a reliable page bounding box; automatic redaction is blocked until manually reviewed)`;
+        } else {
+          detectionStatus = `${pattern.statusNote} (coordinates could not be established on page)`;
+        }
+      }
 
       const item = {
         id: `${idPrefix}_${counter++}`,
@@ -590,11 +608,16 @@ export function detectSensitiveInfo(extractionResult, allowedCategories = null, 
     }
   }
 
+  const unsupportedAnnotations = extractionResult.unsupportedAnnotations || [];
+  const linkAnnotations = extractionResult.linkAnnotations || [];
+
   return {
     totalDetected: detectedItems.length,
     categoryBreakdown,
     disclaimer:
       'Automated pattern matching identifies common sensitive formats but cannot guarantee detection of every context-dependent personal detail. Uncertain detections are marked with LOW_UNCERTAIN confidence for human review.',
     items: detectedItems,
+    ...(unsupportedAnnotations.length > 0 ? { unsupportedAnnotations } : {}),
+    ...(linkAnnotations.length > 0 ? { linkAnnotations } : {}),
   };
 }

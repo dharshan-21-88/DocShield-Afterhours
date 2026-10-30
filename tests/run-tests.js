@@ -1,6 +1,6 @@
 import assert from 'assert';
 import fs from 'fs';
-import { PDFDocument, StandardFonts, rgb } from 'pdf-lib';
+import { PDFDocument, StandardFonts, rgb, PDFString } from 'pdf-lib';
 import { createCanvas } from '@napi-rs/canvas';
 import { createApp } from '../server.js';
 import { generateSamplePdfFile } from '../extraction/samples.js';
@@ -1681,6 +1681,326 @@ async function runTests() {
           true,
           'Unselected selectable-text email must remain visible and be reported in remainingItems'
         );
+      },
+    },
+
+    // =========================================================================
+    // P2.1 SECURITY CHALLENGE: ACROFORM WIDGETS & VISUAL ANNOTATIONS
+    // =========================================================================
+    {
+      name: '[P2.1 Test A] AcroForm Text Field Containing Synthetic PAN (ABCDE1234F): Extraction, Validated Bounding Box, Automatic Redaction & OCR Verification',
+      fn: async () => {
+        const pdfDoc = await PDFDocument.create();
+        const form = pdfDoc.getForm();
+        const page = pdfDoc.addPage([595.28, 841.89]);
+        const fontBold = await pdfDoc.embedFont(StandardFonts.HelveticaBold);
+        const fontRegular = await pdfDoc.embedFont(StandardFonts.Helvetica);
+
+        page.drawText('INTERACTIVE KYC TAX DECLARATION FORM (FICTIONAL)', {
+          x: 50,
+          y: 770,
+          size: 15,
+          font: fontBold,
+        });
+        page.drawText('Applicant Name: Vikramaditya Rao (Synthetic Form Record)', {
+          x: 50,
+          y: 730,
+          size: 12,
+          font: fontRegular,
+        });
+        page.drawText('Enter Permanent Account Number (PAN) in Form Box Below:', {
+          x: 50,
+          y: 650,
+          size: 12,
+          font: fontRegular,
+        });
+
+        // Create an interactive AcroForm text widget at bottom-left (x=60, y=600, width=220, height=28)
+        // Expected top-left y ≈ 841.89 - 628 = 213.89pt
+        const panField = form.createTextField('applicant_pan_widget');
+        panField.setText('ABCDE1234F');
+        panField.addToPage(page, { x: 60, y: 600, width: 220, height: 28 });
+
+        const buf = Buffer.from(await pdfDoc.save());
+        const up = await uploadCustomPdfBuffer(buf, 'acroform_pan_test.pdf');
+        assert.strictEqual(up.status, 201);
+        const docId = up.body.documentId;
+
+        const detRes = await fetch(`${baseUrl}/api/detect`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ documentId: docId }),
+        });
+        const detBody = await detRes.json();
+        assert.strictEqual(detRes.status, 200);
+        assert.strictEqual(detBody.totalDetected, 1, 'Must detect the PAN inside the AcroForm text widget');
+
+        const panItem = detBody.items[0];
+        assert.strictEqual(panItem.text, 'ABCDE1234F');
+        assert.strictEqual(panItem.category, 'NATIONAL_ID_PAN');
+        assert.ok(panItem.boundingBox, 'AcroForm PAN item must have a valid boundingBox');
+        assert.ok(
+          Math.abs(panItem.boundingBox.x - 60) <= 5 && Math.abs(panItem.boundingBox.y - 213.89) <= 5,
+          `AcroForm widget boundingBox (${JSON.stringify(panItem.boundingBox)}) must match the converted widget rect (~60, ~213.4)`
+        );
+
+        // Run automatic redaction
+        const redRes = await fetch(`${baseUrl}/api/redact`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ documentId: docId, mode: 'automatic' }),
+        });
+        assert.strictEqual(redRes.status, 200);
+
+        // Verify via OCR on the exported page image that ABCDE1234F is completely masked
+        const verRes = await fetch(`${baseUrl}/api/verify`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ documentId: docId, runOcrCheck: true }),
+        });
+        const verBody = await verRes.json();
+        assert.strictEqual(verRes.status, 200);
+        assert.strictEqual(
+          verBody.verification.selectedStillDetectableCount,
+          0,
+          'AcroForm PAN must be visually masked on the exported page image and undetectable by OCR'
+        );
+        assert.strictEqual(verBody.verification.successfullyRemovedCount, 1);
+      },
+    },
+    {
+      name: '[P2.1 Test B] Visible FreeText Annotation Containing Synthetic Phone (+91 9876543210): Detection, Redaction & OCR Verification',
+      fn: async () => {
+        const pdfDoc = await PDFDocument.create();
+        const page = pdfDoc.addPage([595.28, 841.89]);
+        const font = await pdfDoc.embedFont(StandardFonts.Helvetica);
+
+        page.drawText('DOCUMENT WITH VISIBLE FREETEXT ANNOTATION (FICTIONAL)', {
+          x: 50,
+          y: 770,
+          size: 14,
+          font,
+        });
+        page.drawText('General academic record with a visible FreeText callout box below.', {
+          x: 50,
+          y: 735,
+          size: 12,
+          font,
+        });
+
+        // Create a visible FreeText annotation with a normal appearance stream (/AP /N)
+        // at bottom-left Rect [60, 420, 340, 455] -> top-left y = 841.89 - 455 = 386.89, height = 35
+        const apStream = pdfDoc.context.flateStream(
+          'BT /Helv 14 Tf 0 0 0 rg 6 10 Td (FreeText Phone: +91 9876543210) Tj ET',
+          {
+            Type: 'XObject',
+            Subtype: 'Form',
+            BBox: [0, 0, 280, 35],
+            Resources: {
+              Font: {
+                Helv: font.ref,
+              },
+            },
+          }
+        );
+        const apRef = pdfDoc.context.register(apStream);
+
+        const freeTextDict = pdfDoc.context.obj({
+          Type: 'Annot',
+          Subtype: 'FreeText',
+          Rect: [60, 420, 340, 455],
+          Contents: PDFString.of('FreeText Phone: +91 9876543210'),
+          DA: PDFString.of('/Helv 14 Tf 0 0 0 rg'),
+          AP: { N: apRef },
+        });
+        page.node.addAnnot(pdfDoc.context.register(freeTextDict));
+
+        const buf = Buffer.from(await pdfDoc.save());
+        const up = await uploadCustomPdfBuffer(buf, 'freetext_phone_test.pdf');
+        assert.strictEqual(up.status, 201);
+        const docId = up.body.documentId;
+
+        const detRes = await fetch(`${baseUrl}/api/detect`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ documentId: docId }),
+        });
+        const detBody = await detRes.json();
+        assert.strictEqual(detRes.status, 200);
+        assert.strictEqual(detBody.totalDetected, 1, 'Must detect phone number inside visible FreeText annotation');
+
+        const phoneItem = detBody.items[0];
+        assert.strictEqual(phoneItem.category, 'PHONE_NUMBER');
+        assert.ok(phoneItem.boundingBox, 'FreeText annotation phone item must have a valid boundingBox');
+        assert.ok(
+          Math.abs(phoneItem.boundingBox.x - 60) <= 5 && Math.abs(phoneItem.boundingBox.y - 386.89) <= 5,
+          `FreeText boundingBox (${JSON.stringify(phoneItem.boundingBox)}) must match converted annotation Rect (~60, ~386.89)`
+        );
+
+        const redRes = await fetch(`${baseUrl}/api/redact`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ documentId: docId, mode: 'automatic' }),
+        });
+        assert.strictEqual(redRes.status, 200);
+
+        const verRes = await fetch(`${baseUrl}/api/verify`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ documentId: docId, runOcrCheck: true }),
+        });
+        const verBody = await verRes.json();
+        assert.strictEqual(verRes.status, 200);
+        assert.strictEqual(
+          verBody.verification.selectedStillDetectableCount,
+          0,
+          'Visible FreeText annotation phone number must be permanently masked on the exported page image'
+        );
+        assert.strictEqual(verBody.verification.successfullyRemovedCount, 1);
+      },
+    },
+    {
+      name: '[P2.1 Test C] Selective Redaction of AcroForm PAN While Preserving Unselected Email in Normal Page Text',
+      fn: async () => {
+        const pdfDoc = await PDFDocument.create();
+        const form = pdfDoc.getForm();
+        const page = pdfDoc.addPage([595.28, 841.89]);
+        const font = await pdfDoc.embedFont(StandardFonts.Helvetica);
+
+        page.drawText('SELECTIVE ACROFORM REDACTION TEST (FICTIONAL)', { x: 50, y: 770, size: 14, font });
+        page.drawText('Unselected Contact Email: faculty.advisor@fictional-univ.edu', {
+          x: 50,
+          y: 720,
+          size: 12,
+          font,
+        });
+
+        const panField = form.createTextField('selective_pan_widget');
+        panField.setText('ABCDE1234F');
+        panField.addToPage(page, { x: 60, y: 580, width: 220, height: 28 });
+
+        const buf = Buffer.from(await pdfDoc.save());
+        const up = await uploadCustomPdfBuffer(buf, 'selective_acroform_test.pdf');
+        assert.strictEqual(up.status, 201);
+        const docId = up.body.documentId;
+
+        const detRes = await fetch(`${baseUrl}/api/detect`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ documentId: docId }),
+        });
+        const detBody = await detRes.json();
+        assert.strictEqual(detRes.status, 200);
+        assert.strictEqual(detBody.totalDetected, 2);
+
+        const panItem = detBody.items.find((i) => i.category === 'NATIONAL_ID_PAN');
+        const emailItem = detBody.items.find((i) => i.category === 'EMAIL_ADDRESS');
+        assert.ok(panItem && emailItem, 'Must detect both the form-field PAN and the normal page email');
+
+        // Selectively redact ONLY the AcroForm PAN item
+        const redRes = await fetch(`${baseUrl}/api/redact`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            documentId: docId,
+            mode: 'selective',
+            selectedItemIds: [panItem.id],
+          }),
+        });
+        assert.strictEqual(redRes.status, 200);
+
+        const verRes = await fetch(`${baseUrl}/api/verify`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ documentId: docId, runOcrCheck: true }),
+        });
+        const verBody = await verRes.json();
+        assert.strictEqual(verRes.status, 200);
+        assert.strictEqual(verBody.verification.successfullyRemovedCount, 1, 'Selected AcroForm PAN must be removed');
+        assert.strictEqual(verBody.verification.selectedStillDetectableCount, 0);
+        assert.strictEqual(
+          verBody.verification.remainingItems.some((r) => r.text === 'faculty.advisor@fictional-univ.edu'),
+          true,
+          'Unselected normal-text email must remain detectable and be reported in remainingItems'
+        );
+      },
+    },
+    {
+      name: '[P2.1 Test D] Annotation Without Reliable Bounding Box Reports Explicit Limitation & Blocks Silent Redaction',
+      fn: async () => {
+        const pdfDoc = await PDFDocument.create();
+        const page = pdfDoc.addPage([595.28, 841.89]);
+        const font = await pdfDoc.embedFont(StandardFonts.Helvetica);
+
+        page.drawText('UNSUPPORTED ANNOTATION BOUNDING BOX TEST (FICTIONAL)', {
+          x: 50,
+          y: 770,
+          size: 14,
+          font,
+        });
+        page.drawText('Selectable Registration No: REG-2026-AN-0101', {
+          x: 50,
+          y: 725,
+          size: 12,
+          font,
+        });
+
+        // Add a sticky-note Text annotation with zero-area/off-page coordinates [0, 0, 0, 0]
+        // containing a synthetic Aadhaar number (4829 7301 9482)
+        const unlocatableAnnot = pdfDoc.context.obj({
+          Type: 'Annot',
+          Subtype: 'Text',
+          Rect: [0, 0, 0, 0],
+          Contents: PDFString.of('Hidden sticky note Aadhaar: 4829 7301 9482'),
+        });
+        page.node.addAnnot(pdfDoc.context.register(unlocatableAnnot));
+
+        const buf = Buffer.from(await pdfDoc.save());
+        const up = await uploadCustomPdfBuffer(buf, 'unsupported_annot_test.pdf');
+        assert.strictEqual(up.status, 201);
+        assert.ok(
+          Array.isArray(up.body.extraction.unsupportedAnnotations) &&
+            up.body.extraction.unsupportedAnnotations.length === 1,
+          'Upload response must surface unsupportedAnnotations warning'
+        );
+
+        const docId = up.body.documentId;
+        const detRes = await fetch(`${baseUrl}/api/detect`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ documentId: docId }),
+        });
+        const detBody = await detRes.json();
+        assert.strictEqual(detRes.status, 200);
+
+        // Verify the Aadhaar in the unlocatable annotation is detected with boundingBox: null (never fabricated)
+        // and carries an explicit UNSUPPORTED_ANNOTATION_COORDINATES status
+        const unlocItem = detBody.items.find((i) => i.text === '4829 7301 9482');
+        assert.ok(unlocItem, 'Must detect sensitive value inside the unlocatable annotation');
+        assert.strictEqual(unlocItem.boundingBox, null, 'Must NOT invent a bounding box for an unlocatable annotation');
+        assert.ok(
+          unlocItem.detectionStatus.includes('UNSUPPORTED_ANNOTATION_COORDINATES'),
+          `Expected UNSUPPORTED_ANNOTATION_COORDINATES in detectionStatus, got "${unlocItem.detectionStatus}"`
+        );
+        assert.ok(
+          Array.isArray(detBody.unsupportedAnnotations) && detBody.unsupportedAnnotations.length === 1,
+          'Detect response must include unsupportedAnnotations details'
+        );
+
+        // Verify automatic redaction refuses to silently claim success and returns HTTP 422 REDACTION_COORDINATES_MISSING
+        const autoRedRes = await fetch(`${baseUrl}/api/redact`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ documentId: docId, mode: 'automatic' }),
+        });
+        const autoRedBody = await autoRedRes.json();
+        assert.strictEqual(
+          autoRedRes.status,
+          422,
+          'Automatic redaction must fail-closed with 422 when an annotation item lacks reliable coordinates'
+        );
+        assert.strictEqual(autoRedBody.error, 'REDACTION_COORDINATES_MISSING');
+        assert.strictEqual(autoRedBody.details.unlocatableItems[0].id, unlocItem.id);
       },
     },
   ];
