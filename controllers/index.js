@@ -51,6 +51,7 @@ async function processUploadedPdfFile(filePath, originalName, fileSizeBytes) {
       originalFilePath: filePath,
       originalSha256,
       extraction,
+      structuralAudit: extraction.structuralAudit || null,
       detectedItems: null,
       selectedItemIds: [],
       redactionMode: null,
@@ -66,11 +67,13 @@ async function processUploadedPdfFile(filePath, originalName, fileSizeBytes) {
       fileName: record.fileName,
       fileSizeBytes: record.fileSizeBytes,
       originalSha256: record.originalSha256,
+      structuralAudit: extraction.structuralAudit || null,
       extraction: {
         pageCount: extraction.pageCount,
         extractionMethod: extraction.extractionMethod,
         usedOcrFallback: extraction.usedOcrFallback,
         totalCharacters: extraction.totalCharacters,
+        structuralAudit: extraction.structuralAudit || null,
         ...(Array.isArray(extraction.unsupportedAnnotations) && extraction.unsupportedAnnotations.length > 0
           ? { unsupportedAnnotations: extraction.unsupportedAnnotations }
           : {}),
@@ -170,6 +173,7 @@ export async function detectSensitiveController(req, res, next) {
     updateDocumentRecord(documentId, {
       detectedItems: detectionResult.items,
       categoryBreakdown: detectionResult.categoryBreakdown,
+      structuralAudit: detectionResult.structuralAudit,
     });
 
     res.status(200).json({
@@ -179,6 +183,7 @@ export async function detectSensitiveController(req, res, next) {
       categoryBreakdown: detectionResult.categoryBreakdown,
       disclaimer: detectionResult.disclaimer,
       items: detectionResult.items,
+      structuralAudit: detectionResult.structuralAudit,
       ...(detectionResult.unsupportedAnnotations ? { unsupportedAnnotations: detectionResult.unsupportedAnnotations } : {}),
       ...(detectionResult.linkAnnotations ? { linkAnnotations: detectionResult.linkAnnotations } : {}),
     });

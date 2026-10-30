@@ -1,6 +1,6 @@
 import assert from 'assert';
 import fs from 'fs';
-import { PDFDocument, StandardFonts, rgb, PDFString } from 'pdf-lib';
+import { PDFDocument, StandardFonts, rgb, PDFString, PDFName } from 'pdf-lib';
 import { createCanvas } from '@napi-rs/canvas';
 import { createApp } from '../server.js';
 import { generateSamplePdfFile } from '../extraction/samples.js';
@@ -2001,6 +2001,496 @@ async function runTests() {
         );
         assert.strictEqual(autoRedBody.error, 'REDACTION_COORDINATES_MISSING');
         assert.strictEqual(autoRedBody.details.unlocatableItems[0].id, unlocItem.id);
+      },
+    },
+
+    // =========================================================================
+    // P2.2 SECURITY CHALLENGE: HIDDEN PDF STRUCTURE INSPECTION
+    // =========================================================================
+    {
+      name: '[P2.2 Test A] Sensitive PII in PDF Title, Author and Keywords Metadata (Separated from Page Coordinates)',
+      fn: async () => {
+        const pdfDoc = await PDFDocument.create();
+        pdfDoc.setTitle('Confidential Tax Record for PAN ABCDE1234F');
+        pdfDoc.setAuthor('aarav.sharma@fictional-univ.edu');
+        pdfDoc.setSubject('Clean General Subject');
+        pdfDoc.setKeywords(['REG-2026-CS-0492', '+91 9876543210']);
+
+        const page = pdfDoc.addPage([595.28, 841.89]);
+        const font = await pdfDoc.embedFont(StandardFonts.Helvetica);
+        page.drawText('PUBLIC NOTICE: This visible page body contains zero personal identifiers.', {
+          x: 50,
+          y: 750,
+          size: 12,
+          font,
+        });
+
+        const buf = Buffer.from(await pdfDoc.save());
+        const up = await uploadCustomPdfBuffer(buf, 'metadata_pii_test.pdf');
+        assert.strictEqual(up.status, 201);
+        const docId = up.body.documentId;
+
+        const detRes = await fetch(`${baseUrl}/api/detect`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ documentId: docId }),
+        });
+        const detBody = await detRes.json();
+        assert.strictEqual(detRes.status, 200);
+
+        // 1. Visible page-coordinate detections must remain 0
+        assert.strictEqual(
+          detBody.totalDetected,
+          0,
+          'Metadata PII must NOT be mixed into normal page-coordinate detections'
+        );
+        assert.strictEqual(detBody.items.length, 0);
+
+        // 2. Verify structuralAudit.metadata and structuralAudit.metadataDetections
+        const audit = detBody.structuralAudit;
+        assert.ok(audit, 'Response must include structuralAudit');
+        assert.strictEqual(audit.hasHiddenStructureRisks, true);
+        assert.strictEqual(audit.metadata.hasInfoDictionary, true);
+        assert.ok(audit.metadata.standardFields.Title.includes('ABCDE1234F'));
+        assert.strictEqual(audit.metadata.standardFields.Author, 'aarav.sharma@fictional-univ.edu');
+
+        const metaDets = audit.metadataDetections;
+        assert.ok(Array.isArray(metaDets) && metaDets.length >= 4, 'Must detect PAN, Email, Reg No, and Phone in metadata');
+
+        const titlePan = metaDets.find((d) => d.metadataField === 'Title' && d.category === 'NATIONAL_ID_PAN');
+        const authorEmail = metaDets.find((d) => d.metadataField === 'Author' && d.category === 'EMAIL_ADDRESS');
+        const kwReg = metaDets.find((d) => d.metadataField === 'Keywords' && d.category === 'STUDENT_REG_NUMBER');
+        const kwPhone = metaDets.find((d) => d.metadataField === 'Keywords' && d.category === 'PHONE_NUMBER');
+
+        assert.ok(titlePan && titlePan.text === 'ABCDE1234F', 'Must detect PAN in Title metadata');
+        assert.ok(
+          authorEmail && authorEmail.text === 'aarav.sharma@fictional-univ.edu',
+          'Must detect Email in Author metadata'
+        );
+        assert.ok(kwReg && kwReg.text === 'REG-2026-CS-0492', 'Must detect Student Reg Number in Keywords metadata');
+        assert.ok(kwPhone, 'Must detect Phone Number in Keywords metadata');
+
+        // 3. Never invent page coordinates for metadata detections
+        for (const md of metaDets) {
+          assert.strictEqual(md.pageNumber, null, 'Metadata detection pageNumber must be null');
+          assert.strictEqual(md.boundingBox, null, 'Metadata detection boundingBox must be null');
+        }
+
+        // 4. Verify explicit METADATA_SENSITIVE_DATA_DETECTED warning
+        assert.strictEqual(
+          audit.warnings.some((w) => w.code === 'METADATA_SENSITIVE_DATA_DETECTED'),
+          true,
+          'Must emit METADATA_SENSITIVE_DATA_DETECTED warning'
+        );
+      },
+    },
+    {
+      name: '[P2.2 Test B] Custom Info Dictionary Fields and XMP Metadata Stream Inspection',
+      fn: async () => {
+        const pdfDoc = await PDFDocument.create();
+        pdfDoc.setTitle('General Academic Circular');
+
+        // Add custom field to the PDF /Info dictionary
+        const infoRef = pdfDoc.context.trailerInfo.Info;
+        const infoDict = pdfDoc.context.lookup(infoRef);
+        infoDict.set(PDFName.of('ApplicantPAN'), PDFString.of('ZYXWV9876K'));
+        infoDict.set(PDFName.of('BackupAadhaar'), PDFString.of('4829 7301 9482'));
+
+        // Embed raw XMP metadata stream on the Catalog containing a synthetic email and phone number
+        const xmpPacket = `<?xpacket begin="" id="W5M0MpCehiHzreSzNTczkc9d"?>
+<x:xmpmeta xmlns:x="adobe:ns:meta/">
+ <rdf:RDF xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#">
+  <rdf:Description rdf:about="" xmlns:dc="http://purl.org/dc/elements/1.1/" xmlns:pdf="http://ns.adobe.com/pdf/1.3/">
+   <dc:creator><rdf:Seq><rdf:li>xmp.custodian@fictional-univ.edu</rdf:li></rdf:Seq></dc:creator>
+   <pdf:Keywords>Emergency Contact +91 9876543210</pdf:Keywords>
+  </rdf:Description>
+ </rdf:RDF>
+</x:xmpmeta><?xpacket end="w"?>`;
+
+        const xmpStream = pdfDoc.context.stream(xmpPacket, {
+          Type: 'Metadata',
+          Subtype: 'XML',
+          Length: Buffer.byteLength(xmpPacket, 'utf8'),
+        });
+        pdfDoc.catalog.set(PDFName.of('Metadata'), pdfDoc.context.register(xmpStream));
+
+        const page = pdfDoc.addPage([595.28, 841.89]);
+        const font = await pdfDoc.embedFont(StandardFonts.Helvetica);
+        page.drawText('Visible page with no sensitive information.', { x: 50, y: 750, size: 12, font });
+
+        const buf = Buffer.from(await pdfDoc.save());
+        const up = await uploadCustomPdfBuffer(buf, 'custom_and_xmp_meta.pdf');
+        assert.strictEqual(up.status, 201);
+        const docId = up.body.documentId;
+
+        const detRes = await fetch(`${baseUrl}/api/detect`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ documentId: docId }),
+        });
+        const detBody = await detRes.json();
+        assert.strictEqual(detRes.status, 200);
+
+        const audit = detBody.structuralAudit;
+        assert.strictEqual(audit.metadata.hasXmpMetadata, true, 'Must detect presence of XMP metadata stream');
+        assert.strictEqual(audit.metadata.customFields.ApplicantPAN, 'ZYXWV9876K', 'Must extract Custom Info field ApplicantPAN');
+        assert.strictEqual(audit.metadata.customFields.BackupAadhaar, '4829 7301 9482', 'Must extract Custom Info field BackupAadhaar');
+
+        const customPanDet = audit.metadataDetections.find(
+          (d) => d.metadataField === 'Custom:ApplicantPAN' && d.text === 'ZYXWV9876K'
+        );
+        const customAadhaarDet = audit.metadataDetections.find(
+          (d) => d.metadataField === 'Custom:BackupAadhaar' && d.text === '4829 7301 9482'
+        );
+        const xmpEmailDet = audit.metadataDetections.find(
+          (d) => d.metadataField === 'XMP' && d.text === 'xmp.custodian@fictional-univ.edu'
+        );
+        const xmpPhoneDet = audit.metadataDetections.find(
+          (d) => d.metadataField === 'XMP' && d.category === 'PHONE_NUMBER'
+        );
+
+        assert.ok(customPanDet, 'Must detect PAN inside Custom Info dictionary field');
+        assert.ok(customAadhaarDet, 'Must detect Aadhaar inside Custom Info dictionary field');
+        assert.ok(xmpEmailDet, 'Must detect Email inside XMP metadata stream');
+        assert.ok(xmpPhoneDet, 'Must detect Phone Number inside XMP metadata stream');
+      },
+    },
+    {
+      name: '[P2.2 Test C] Catalog Embedded Attachment (/Names -> /EmbeddedFiles) with Synthetic Sensitive Filename & Uninspected Content Warning',
+      fn: async () => {
+        const pdfDoc = await PDFDocument.create();
+        const page = pdfDoc.addPage([595.28, 841.89]);
+        const font = await pdfDoc.embedFont(StandardFonts.Helvetica);
+        page.drawText('Cover page with an embedded attachment in Catalog /EmbeddedFiles.', {
+          x: 50,
+          y: 750,
+          size: 12,
+          font,
+        });
+
+        // Attach an embedded file whose payload contains an email that must NOT be auto-extracted into page text,
+        // and whose filename contains a synthetic Aadhaar (4829-7301-9482)
+        await pdfDoc.attach(
+          Buffer.from('Uninspected inside file payload: hidden.payload@fictional.org', 'utf8'),
+          'aadhaar_4829-7301-9482_backup.txt',
+          {
+            mimeType: 'text/plain',
+            description: 'Archive copy for PAN ABCDE1234F',
+          }
+        );
+
+        const buf = Buffer.from(await pdfDoc.save());
+        const up = await uploadCustomPdfBuffer(buf, 'catalog_attachment_test.pdf');
+        assert.strictEqual(up.status, 201);
+        const docId = up.body.documentId;
+
+        const detRes = await fetch(`${baseUrl}/api/detect`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ documentId: docId }),
+        });
+        const detBody = await detRes.json();
+        assert.strictEqual(detRes.status, 200);
+
+        // 1. Attachment payload ("hidden.payload@fictional.org") must NOT be added to normal page detections
+        assert.strictEqual(
+          detBody.items.some((i) => i.text.includes('hidden.payload@fictional.org')),
+          false,
+          'Uninspected attachment contents must NOT be added to normal page text detections'
+        );
+
+        // 2. Verify structuralAudit.attachments
+        const attAudit = detBody.structuralAudit.attachments;
+        assert.strictEqual(attAudit.hasAttachments, true);
+        assert.strictEqual(attAudit.totalCount, 1);
+        assert.strictEqual(attAudit.uninspectedCount, 1);
+        assert.strictEqual(attAudit.status, 'ATTACHMENTS_DETECTED_UNINSPECTED');
+
+        const attItem = attAudit.items[0];
+        assert.strictEqual(attItem.filename, 'aadhaar_4829-7301-9482_backup.txt');
+        assert.strictEqual(attItem.contentInspected, false, 'Attachment contentInspected must be false');
+        assert.strictEqual(attItem.inspectionStatus, 'UNINSPECTED_ATTACHMENT_CONTENT');
+        assert.strictEqual(attItem.hasSensitiveFilenameOrDescription, true);
+        assert.strictEqual(
+          attItem.sensitiveMetadataMatches.some((m) => m.category === 'NATIONAL_ID_AADHAAR' && m.text === '4829-7301-9482'),
+          true,
+          'Must detect synthetic Aadhaar in attachment filename'
+        );
+        assert.strictEqual(
+          attItem.sensitiveMetadataMatches.some((m) => m.category === 'NATIONAL_ID_PAN' && m.text === 'ABCDE1234F'),
+          true,
+          'Must detect synthetic PAN in attachment description'
+        );
+
+        // 3. Verify explicit UNINSPECTED_EMBEDDED_ATTACHMENTS warning
+        assert.strictEqual(
+          detBody.structuralAudit.warnings.some((w) => w.code === 'UNINSPECTED_EMBEDDED_ATTACHMENTS'),
+          true,
+          'Must emit UNINSPECTED_EMBEDDED_ATTACHMENTS warning'
+        );
+      },
+    },
+    {
+      name: '[P2.2 Test D] Page-Level FileAttachment Annotation Detection & Uninspected Content Warning',
+      fn: async () => {
+        const pdfDoc = await PDFDocument.create();
+        const page = pdfDoc.addPage([595.28, 841.89]);
+        const font = await pdfDoc.embedFont(StandardFonts.Helvetica);
+        page.drawText('Page containing a FileAttachment annotation paperclip.', {
+          x: 50,
+          y: 750,
+          size: 12,
+          font,
+        });
+
+        const embeddedStream = pdfDoc.context.flateStream('uninspected binary attachment data', {
+          Type: 'EmbeddedFile',
+          Subtype: 'application/pdf',
+        });
+        const filespecDict = pdfDoc.context.obj({
+          Type: 'Filespec',
+          F: PDFString.of('student_REG-2026-CS-0492_transcript.pdf'),
+          UF: PDFString.of('student_REG-2026-CS-0492_transcript.pdf'),
+          Desc: PDFString.of('Transcript attachment for +91 9876543210'),
+          EF: { F: pdfDoc.context.register(embeddedStream) },
+        });
+        const fileAttachAnnot = pdfDoc.context.obj({
+          Type: 'Annot',
+          Subtype: 'FileAttachment',
+          Rect: [80, 620, 104, 644],
+          FS: pdfDoc.context.register(filespecDict),
+          Contents: PDFString.of('Attached transcript file'),
+        });
+        page.node.addAnnot(pdfDoc.context.register(fileAttachAnnot));
+
+        const buf = Buffer.from(await pdfDoc.save());
+        const up = await uploadCustomPdfBuffer(buf, 'page_file_attachment_test.pdf');
+        assert.strictEqual(up.status, 201);
+        const docId = up.body.documentId;
+
+        const detRes = await fetch(`${baseUrl}/api/detect`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ documentId: docId }),
+        });
+        const detBody = await detRes.json();
+        assert.strictEqual(detRes.status, 200);
+
+        const attAudit = detBody.structuralAudit.attachments;
+        assert.strictEqual(attAudit.hasAttachments, true);
+        assert.ok(attAudit.totalCount >= 1, 'Must detect page-level FileAttachment annotation');
+
+        const pageAtt = attAudit.items.find((a) => a.source === 'page-file-attachment');
+        assert.ok(pageAtt, 'Must classify annotation as source: "page-file-attachment"');
+        assert.strictEqual(pageAtt.pageNumber, 1);
+        assert.strictEqual(pageAtt.filename, 'student_REG-2026-CS-0492_transcript.pdf');
+        assert.strictEqual(pageAtt.contentInspected, false);
+        assert.strictEqual(pageAtt.inspectionStatus, 'UNINSPECTED_ATTACHMENT_CONTENT');
+        assert.strictEqual(
+          pageAtt.sensitiveMetadataMatches.some((m) => m.text === 'REG-2026-CS-0492'),
+          true,
+          'Must detect Student Registration Number in FileAttachment filename'
+        );
+        assert.strictEqual(
+          detBody.structuralAudit.warnings.some((w) => w.code === 'UNINSPECTED_EMBEDDED_ATTACHMENTS'),
+          true
+        );
+      },
+    },
+    {
+      name: '[P2.2 Test E] Incrementally Updated PDF Containing an Earlier Synthetic Sensitive Value',
+      fn: async () => {
+        // Revision 1: PDF page contains synthetic PAN ABCDE1234F
+        const pdfDoc = await PDFDocument.create();
+        const font = await pdfDoc.embedFont(StandardFonts.Helvetica);
+        const page = pdfDoc.addPage([595.28, 841.89]);
+        page.drawText('Earlier revision secret PAN: ABCDE1234F', { x: 50, y: 700, size: 12, font });
+
+        const rev1Bytes = Buffer.from(await pdfDoc.save({ useObjectStreams: false }));
+        const rev1Str = rev1Bytes.toString('latin1');
+
+        const startxrefMatch = /startxref\s+(\d+)/.exec(rev1Str);
+        const rev1XrefOffset = Number(startxrefMatch[1]);
+        const fontNameMatch = /\/(Helvetica-[0-9]+)\s+4\s+0\s+R/.exec(rev1Str);
+        const fontKey = fontNameMatch ? fontNameMatch[1] : 'F1';
+
+        // Revision 2 (Incremental Update): Overwrite object 6 (page content stream) with clean public text
+        const newStreamContent = `BT /${fontKey} 12 Tf 50 700 Td (Updated public text with no sensitive items) Tj ET`;
+        const obj6Offset = rev1Bytes.length + 1;
+        const obj6Block = `\n6 0 obj\n<</Length ${newStreamContent.length}>>\nstream\n${newStreamContent}\nendstream\nendobj\n`;
+        const rev2XrefOffset = rev1Bytes.length + Buffer.byteLength(obj6Block, 'latin1');
+        const pad10 = String(obj6Offset).padStart(10, '0');
+        const incrementalTail =
+          `xref\n0 1\n0000000000 65535 f \n6 1\n${pad10} 00000 n \n` +
+          `trailer\n<</Size 7/Root 2 0 R/Info 3 0 R/Prev ${rev1XrefOffset}>>\n` +
+          `startxref\n${rev2XrefOffset}\n%%EOF\n`;
+
+        const incrementalPdfBuf = Buffer.concat([
+          rev1Bytes,
+          Buffer.from(obj6Block + incrementalTail, 'latin1'),
+        ]);
+
+        const up = await uploadCustomPdfBuffer(incrementalPdfBuf, 'incremental_update_leak.pdf');
+        assert.strictEqual(up.status, 201);
+        const docId = up.body.documentId;
+
+        const detRes = await fetch(`${baseUrl}/api/detect`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ documentId: docId }),
+        });
+        const detBody = await detRes.json();
+        assert.strictEqual(detRes.status, 200);
+
+        // Current visible page text has 0 detections
+        assert.strictEqual(detBody.totalDetected, 0, 'Latest visible revision has no page-level PII');
+
+        // Verify incremental revision audit detects the earlier revision and its hidden PAN
+        const revAudit = detBody.structuralAudit.revisions;
+        assert.strictEqual(revAudit.status, 'DETECTED');
+        assert.strictEqual(revAudit.incrementalUpdatesDetected, true);
+        assert.strictEqual(revAudit.confidence, 'HIGH');
+        assert.strictEqual(revAudit.revisionCount, 2);
+        assert.strictEqual(revAudit.prevCount, 1);
+        assert.strictEqual(revAudit.startxrefCount, 2);
+
+        const histPan = revAudit.historicalDetections.find(
+          (d) => d.category === 'NATIONAL_ID_PAN' && d.text === 'ABCDE1234F'
+        );
+        assert.ok(histPan, 'Must detect earlier revision synthetic PAN (ABCDE1234F) in historicalDetections');
+        assert.strictEqual(histPan.revisionNumber, 1);
+        assert.strictEqual(histPan.boundingBox, null);
+
+        assert.strictEqual(
+          detBody.structuralAudit.warnings.some((w) => w.code === 'INCREMENTAL_REVISIONS_DETECTED'),
+          true,
+          'Must emit INCREMENTAL_REVISIONS_DETECTED warning'
+        );
+        assert.strictEqual(
+          detBody.structuralAudit.warnings.some((w) => w.code === 'HISTORICAL_REVISION_SENSITIVE_DATA_DETECTED'),
+          true,
+          'Must emit HISTORICAL_REVISION_SENSITIVE_DATA_DETECTED warning'
+        );
+      },
+    },
+    {
+      name: '[P2.2 Test F] Linearized PDF Must Not Automatically Be Classified as Incrementally Updated',
+      fn: async () => {
+        const pdfDoc = await PDFDocument.create();
+        const font = await pdfDoc.embedFont(StandardFonts.Helvetica);
+        const page = pdfDoc.addPage([500, 500]);
+        page.drawText('Linearized Fast Web View Document (Synthetic Clean Text)', {
+          x: 50,
+          y: 400,
+          size: 12,
+          font,
+        });
+
+        const baseBytes = Buffer.from(await pdfDoc.save({ useObjectStreams: false }));
+        const baseStr = baseBytes.toString('latin1');
+        const headerEnd = baseStr.indexOf('1 0 obj');
+        const headerPart = baseStr.slice(0, headerEnd);
+        const bodyAndTail = baseStr.slice(headerEnd);
+
+        // Insert a standard 260-byte Linearized parameter dictionary + first-page xref section
+        const SHIFT = 260;
+        const origStartxref = Number(/startxref\s+(\d+)/.exec(bodyAndTail)[1]);
+        const newMainXref = origStartxref + SHIFT;
+        const totalLen = baseBytes.length + SHIFT;
+
+        const shiftedBodyAndTail = bodyAndTail
+          .replace(/(\d{10}) 00000 n /g, (_m, offStr) => {
+            return String(Number(offStr) + SHIFT).padStart(10, '0') + ' 00000 n ';
+          })
+          .replace(/startxref\s+\d+/, `startxref\n${newMainXref}`);
+
+        let preamble =
+          `99 0 obj\n<</Linearized 1/L ${totalLen}/H [ 120 60 ]/O 5/E 500/N 1/T ${newMainXref}>>\nendobj\n` +
+          `xref\n99 1\n${String(headerPart.length).padStart(10, '0')} 00000 n \n` +
+          `trailer\n<</Size 100/Root 2 0 R/Info 3 0 R/Prev ${newMainXref}>>\nstartxref\n0\n%%EOF\n`;
+        const padNeeded = SHIFT - Buffer.byteLength(preamble, 'latin1');
+        preamble = preamble.replace('%%EOF\n', '%%EOF' + ' '.repeat(padNeeded) + '\n');
+
+        const linearizedBuf = Buffer.from(headerPart + preamble + shiftedBodyAndTail, 'latin1');
+
+        const up = await uploadCustomPdfBuffer(linearizedBuf, 'linearized_clean.pdf');
+        assert.strictEqual(up.status, 201);
+        const docId = up.body.documentId;
+
+        const detRes = await fetch(`${baseUrl}/api/detect`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ documentId: docId }),
+        });
+        const detBody = await detRes.json();
+        assert.strictEqual(detRes.status, 200);
+
+        const revAudit = detBody.structuralAudit.revisions;
+        assert.strictEqual(revAudit.isLinearized, true, 'Must identify PDF as linearized');
+        assert.strictEqual(
+          revAudit.status,
+          'NOT_DETECTED',
+          `Linearized PDF must NOT be falsely classified as incrementally updated (got status="${revAudit.status}", reason="${revAudit.reason}")`
+        );
+        assert.strictEqual(revAudit.incrementalUpdatesDetected, false);
+        assert.strictEqual(revAudit.confidence, 'HIGH');
+        assert.strictEqual(
+          detBody.structuralAudit.warnings.some((w) => w.code === 'INCREMENTAL_REVISIONS_DETECTED'),
+          false,
+          'Must not emit INCREMENTAL_REVISIONS_DETECTED warning for a clean linearized PDF'
+        );
+      },
+    },
+    {
+      name: '[P2.2 Test G] Malformed Revision Structure Returns INDETERMINATE Status Rather Than False Clean Result',
+      fn: async () => {
+        const pdfDoc = await PDFDocument.create();
+        const font = await pdfDoc.embedFont(StandardFonts.Helvetica);
+        const page = pdfDoc.addPage([500, 500]);
+        page.drawText('Document with damaged trailer /Prev and startxref offsets.', {
+          x: 50,
+          y: 400,
+          size: 12,
+          font,
+        });
+
+        const baseBytes = Buffer.from(await pdfDoc.save({ useObjectStreams: false }));
+        const baseStr = baseBytes.toString('latin1');
+
+        // Corrupt the trailer by adding an out-of-bounds /Prev 999999 and invalid startxref 888888
+        // (PDF.js recovers the page via its internal XRef recovery scanner, while our revision inspector catches the anomaly)
+        const malformedStr = baseStr
+          .replace('/Root 2 0 R', '/Root 2 0 R/Prev 999999')
+          .replace(/startxref\s+\d+/, 'startxref\n888888');
+        const malformedBuf = Buffer.from(malformedStr, 'latin1');
+
+        const up = await uploadCustomPdfBuffer(malformedBuf, 'malformed_revisions.pdf');
+        assert.strictEqual(up.status, 201);
+        const docId = up.body.documentId;
+
+        const detRes = await fetch(`${baseUrl}/api/detect`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ documentId: docId }),
+        });
+        const detBody = await detRes.json();
+        assert.strictEqual(detRes.status, 200);
+
+        const revAudit = detBody.structuralAudit.revisions;
+        assert.strictEqual(
+          revAudit.status,
+          'INDETERMINATE',
+          `Malformed revision structure must return status "INDETERMINATE", got "${revAudit.status}"`
+        );
+        assert.strictEqual(revAudit.incrementalUpdatesDetected, null);
+        assert.strictEqual(revAudit.confidence, 'LOW_UNCERTAIN');
+        assert.ok(revAudit.reason.includes('Malformed or inconsistent PDF revision structure'));
+
+        assert.strictEqual(
+          detBody.structuralAudit.warnings.some((w) => w.code === 'INDETERMINATE_REVISION_STRUCTURE'),
+          true,
+          'Must emit INDETERMINATE_REVISION_STRUCTURE warning rather than a false clean result'
+        );
       },
     },
   ];

@@ -1,7 +1,9 @@
 import fs from 'fs/promises';
+import zlib from 'zlib';
 import * as pdfjsLib from 'pdfjs-dist/legacy/build/pdf.mjs';
 import { createCanvas } from '@napi-rs/canvas';
 import { createWorker } from 'tesseract.js';
+import { buildStructuralAudit } from '../detection/index.js';
 
 /**
  * Custom CanvasFactory required by pdfjs-dist in Node.js environments
@@ -327,6 +329,7 @@ async function extractPageAnnotations(page, viewport, pageNum) {
       unlocatableAnnotationTexts: [],
       unsupportedAnnotations: [],
       linkAnnotations: [],
+      fileAttachmentAnnotations: [],
     };
   }
 
@@ -335,6 +338,7 @@ async function extractPageAnnotations(page, viewport, pageNum) {
   const unlocatableAnnotationTexts = [];
   const unsupportedAnnotations = [];
   const linkAnnotations = [];
+  const fileAttachmentAnnotations = [];
 
   for (const ann of rawAnnotations) {
     const subtype = ann?.subtype || 'Unknown';
@@ -354,6 +358,39 @@ async function extractPageAnnotations(page, viewport, pageNum) {
           rect: Array.isArray(ann.rect) ? ann.rect : null,
         });
       }
+      continue;
+    }
+
+    // 2. Page-level FileAttachment annotations: record in structuralAudit.attachments without adding uninspected
+    //    attachment contents or attachment metadata to normal page-coordinate detections.
+    if (subtype === 'FileAttachment') {
+      const fileObj = ann.file || {};
+      const filename =
+        fileObj.filename ||
+        fileObj.rawFilename ||
+        ann.titleObj?.str ||
+        'page_file_attachment';
+      const rawFilename = fileObj.rawFilename || fileObj.filename || null;
+      const description = fileObj.description || ann.contentsObj?.str || ann.contents || '';
+      const contentByteLength =
+        fileObj.content && typeof fileObj.content.byteLength === 'number'
+          ? fileObj.content.byteLength
+          : null;
+
+      fileAttachmentAnnotations.push({
+        id: ann.id ? `page_att_${pageNum}_${ann.id}` : `page_att_${pageNum}_${fileAttachmentAnnotations.length + 1}`,
+        pageNumber: pageNum,
+        source: 'page-file-attachment',
+        subtype: 'FileAttachment',
+        filename,
+        rawFilename,
+        description,
+        annotationContents: ann.contentsObj?.str || ann.contents || '',
+        contentByteLength,
+        rect: Array.isArray(ann.rect) ? ann.rect : null,
+        contentInspected: false,
+        inspectionStatus: 'UNINSPECTED_ATTACHMENT_CONTENT',
+      });
       continue;
     }
 
@@ -392,7 +429,7 @@ async function extractPageAnnotations(page, viewport, pageNum) {
         annotationSubtype: subtype,
         fieldType: ann.fieldType || null,
         fieldName: ann.fieldName || null,
-         fullRectCover: true,
+        fullRectCover: true,
       });
       visualAnnotationTexts.push(extractedText);
     } else {
@@ -430,6 +467,654 @@ async function extractPageAnnotations(page, viewport, pageNum) {
     unlocatableAnnotationTexts,
     unsupportedAnnotations,
     linkAnnotations,
+    fileAttachmentAnnotations,
+  };
+}
+
+/**
+ * Replace binary content inside `stream ... endstream` blocks with spaces of the exact same byte length
+ * so all byte offsets (`startxref`, `/Prev`, `xref`, object offsets) remain 100% identical while preventing
+ * compressed stream bytes from producing false structural token matches.
+ */
+function maskBinaryStreamsPreservingOffsets(rawPdfLatin1) {
+  return rawPdfLatin1.replace(/(stream(?:\r\n|\n|\r))([\s\S]*?)((?:\r\n|\n|\r)?endstream)/g, (_m, p1, body, p3) => {
+    return p1 + ' '.repeat(body.length) + p3;
+  });
+}
+
+/**
+ * Decode a PDF hexadecimal string `<...>` (supporting both ASCII/WinAnsi and UTF-16BE with BOM `FEFF`).
+ */
+function decodePdfHexString(hexContent) {
+  const cleanHex = String(hexContent || '').replace(/\s+/g, '');
+  if (cleanHex.length < 4) return '';
+  const paddedHex = cleanHex.length % 2 === 1 ? `${cleanHex}0` : cleanHex;
+  if (!/^[0-9A-Fa-f]+$/.test(paddedHex)) return '';
+
+  const buf = Buffer.from(paddedHex, 'hex');
+  if (buf.length >= 2 && buf[0] === 0xfe && buf[1] === 0xff) {
+    // UTF-16BE with BOM
+    const payload = Buffer.alloc(buf.length - 2);
+    for (let i = 2; i + 1 < buf.length; i += 2) {
+      payload[i - 2] = buf[i + 1];
+      payload[i - 1] = buf[i];
+    }
+    return payload.toString('utf16le').replace(/\0/g, '').trim();
+  }
+
+  let out = '';
+  for (let i = 0; i < buf.length; i++) {
+    const b = buf[i];
+    if ((b >= 32 && b <= 126) || b === 9 || b === 10 || b === 13) {
+      out += String.fromCharCode(b);
+    } else if (b === 0) {
+      continue;
+    } else {
+      out += ' ';
+    }
+  }
+  return out.replace(/\s+/g, ' ').trim();
+}
+
+/**
+ * Decode a PDF literal string `(...)` with standard escape sequences.
+ */
+function decodePdfLiteralString(litContent) {
+  return String(litContent || '')
+    .replace(/\\(\d{1,3})/g, (_m, oct) => String.fromCharCode(parseInt(oct, 8)))
+    .replace(/\\n/g, '\n')
+    .replace(/\\r/g, '\r')
+    .replace(/\\t/g, '\t')
+    .replace(/\\\(/g, '(')
+    .replace(/\\\)/g, ')')
+    .replace(/\\\\/g, '\\')
+    .replace(/\0/g, '')
+    .trim();
+}
+
+/**
+ * Safely extract human-readable text and attribute values from raw XMP XML metadata
+ * without using an external XML parser or expanding external entities.
+ */
+function sanitizeXmpXmlToText(rawXmp) {
+  if (!rawXmp || typeof rawXmp !== 'string') return '';
+  const boundedXmp = rawXmp.slice(0, 262144);
+
+  const decodeEntities = (s) =>
+    s
+      .replace(/&quot;/g, '"')
+      .replace(/&apos;/g, "'")
+      .replace(/&lt;/g, '<')
+      .replace(/&gt;/g, '>')
+      .replace(/&amp;/g, '&');
+
+  // Collect attribute values inside RDF descriptions (excluding xmlns/rdf:about/xmpmeta boilerplate URIs)
+  const attrValues = [];
+  const attrRegex = /\b([A-Za-z0-9_]+:[A-Za-z0-9_-]+)\s*=\s*"([^"]+)"/g;
+  let attrMatch;
+  while ((attrMatch = attrRegex.exec(boundedXmp)) !== null) {
+    const attrName = attrMatch[1];
+    const attrVal = attrMatch[2];
+    if (
+      attrName.startsWith('xmlns:') ||
+      attrName === 'rdf:about' ||
+      attrName === 'x:xmptk' ||
+      /^https?:\/\/ns\.adobe\.com|^http:\/\/www\.w3\.org|^http:\/\/purl\.org/i.test(attrVal)
+    ) {
+      continue;
+    }
+    attrValues.push(decodeEntities(attrVal));
+  }
+
+  // Strip processing instructions, comments, and XML tags to extract text nodes
+  const tagStripped = decodeEntities(
+    boundedXmp
+      .replace(/<\?[\s\S]*?\?>/g, ' ')
+      .replace(/<!--[\s\S]*?-->/g, ' ')
+      .replace(/<[^>]+>/g, ' ')
+  )
+    .replace(/\s+/g, ' ')
+    .trim();
+
+  return [tagStripped, ...attrValues].filter(Boolean).join(' ').replace(/\s+/g, ' ').trim();
+}
+
+/**
+ * Extract readable text strings (both literal `(...)` and hex `<...>`) from a raw PDF byte segment,
+ * including inflating any `/FlateDecode` streams inside that segment.
+ */
+function extractReadableStringsFromPdfSegment(segmentLatin1) {
+  if (!segmentLatin1) return '';
+  const collected = [];
+
+  const collectFromContentString = (str) => {
+    const litRegex = /\(([^()\\]*(?:\\.[^()\\]*)*)\)/g;
+    let m;
+    while ((m = litRegex.exec(str)) !== null) {
+      const dec = decodePdfLiteralString(m[1]);
+      if (dec.length >= 4) collected.push(dec);
+    }
+
+    const hexRegex = /<([0-9A-Fa-f\s]{8,})>/g;
+    while ((m = hexRegex.exec(str)) !== null) {
+      const dec = decodePdfHexString(m[1]);
+      if (dec.length >= 4) collected.push(dec);
+    }
+  };
+
+  // 1. Scan non-stream object dictionaries and uncompressed content in the segment
+  const nonStream = maskBinaryStreamsPreservingOffsets(segmentLatin1);
+  collectFromContentString(nonStream);
+
+  // 2. Inflate any FlateDecode streams in the segment and extract text literals / hex strings
+  const streamRegex = /<<([\s\S]{0,400}?)>>\s*stream(?:\r\n|\n|\r)([\s\S]*?)(?:\r\n|\n|\r)?endstream/g;
+  let sm;
+  while ((sm = streamRegex.exec(segmentLatin1)) !== null) {
+    const dictHeader = sm[1] || '';
+    const streamBodyLatin1 = sm[2] || '';
+    if (/\/Subtype\s*\/Image\b|\/Type\s*\/XRef\b/i.test(dictHeader)) {
+      continue;
+    }
+
+    if (/\/Filter\s*(?:\/FlateDecode|\[\s*\/FlateDecode\b)/i.test(dictHeader)) {
+      try {
+        const inflated = zlib
+          .inflateSync(Buffer.from(streamBodyLatin1, 'latin1'), { maxOutputLength: 2 * 1024 * 1024 })
+          .toString('latin1');
+        collectFromContentString(inflated);
+      } catch {
+        // Ignore streams that cannot be inflated
+      }
+    } else {
+      collectFromContentString(streamBodyLatin1);
+    }
+  }
+
+  return collected.join('\n');
+}
+
+/**
+ * Inspect PDF document metadata (`/Info` standard & custom fields + XMP metadata stream).
+ */
+async function inspectPdfMetadataStructure(pdfDoc, rawPdfLatin1) {
+  let pdfjsMeta = null;
+  try {
+    pdfjsMeta = await pdfDoc.getMetadata();
+  } catch {
+    pdfjsMeta = null;
+  }
+
+  const info = pdfjsMeta?.info || {};
+  const standardKeys = [
+    'Title',
+    'Author',
+    'Subject',
+    'Keywords',
+    'Creator',
+    'Producer',
+    'CreationDate',
+    'ModDate',
+  ];
+
+  const standardFields = {};
+  const populatedFieldNames = [];
+  let hasInfoDictionary = false;
+
+  for (const key of standardKeys) {
+    const val = typeof info[key] === 'string' && info[key].trim() ? info[key].trim() : null;
+    standardFields[key] = val;
+    if (val) {
+      hasInfoDictionary = true;
+      populatedFieldNames.push(key);
+    }
+  }
+
+  const customFields = {};
+  if (info.Custom) {
+    const entries =
+      info.Custom instanceof Map
+        ? Array.from(info.Custom.entries())
+        : typeof info.Custom === 'object'
+        ? Object.entries(info.Custom)
+        : [];
+    for (const [k, v] of entries) {
+      if (v !== undefined && v !== null && String(v).trim()) {
+        customFields[String(k)] = String(v).trim();
+        hasInfoDictionary = true;
+        populatedFieldNames.push(`Custom:${k}`);
+      }
+    }
+  }
+
+  let rawXmp = null;
+  try {
+    if (pdfjsMeta?.metadata && typeof pdfjsMeta.metadata.getRaw === 'function') {
+      rawXmp = pdfjsMeta.metadata.getRaw();
+    }
+  } catch {
+    rawXmp = null;
+  }
+
+  // Fallback check if raw XMP packet exists in the file stream but was not parsed by pdfjs-dist
+  if (!rawXmp && rawPdfLatin1) {
+    const xmpMatch = /<x:xmpmeta[\s\S]{1,262144}?<\/x:xmpmeta>/i.exec(rawPdfLatin1);
+    if (xmpMatch) {
+      rawXmp = xmpMatch[0];
+    }
+  }
+
+  const hasXmpMetadata = Boolean(rawXmp && rawXmp.trim());
+  const xmpText = hasXmpMetadata ? sanitizeXmpXmlToText(rawXmp) : '';
+  if (hasXmpMetadata) {
+    populatedFieldNames.push('XMP');
+  }
+
+  return {
+    metaInfo: info,
+    hasInfoDictionary,
+    hasXmpMetadata,
+    xmpLength: rawXmp ? rawXmp.length : 0,
+    xmpText,
+    standardFields,
+    customFields,
+    populatedFieldNames,
+  };
+}
+
+/**
+ * Inspect embedded attachments across:
+ * 1. Catalog `/Names -> /EmbeddedFiles` via `pdfDoc.getAttachments()` (supporting both Map and Object).
+ * 2. Page-level `FileAttachment` annotations collected from `page.getAnnotations()`.
+ * 3. Catalog `/AF` (Associated Files), `/Collection` (PDF Portfolio), and raw `/Filespec` dictionaries.
+ */
+async function inspectPdfAttachmentStructure(pdfDoc, pageFileAttachments, metaInfo, nonStreamPdfLatin1) {
+  const items = [];
+  const seenKeys = new Set();
+
+  // 1. Inspect Catalog /Names -> /EmbeddedFiles via PDF.js getAttachments()
+  try {
+    const rawAttachments = await pdfDoc.getAttachments();
+    if (rawAttachments) {
+      const entries =
+        rawAttachments instanceof Map
+          ? Array.from(rawAttachments.entries())
+          : typeof rawAttachments === 'object'
+          ? Object.entries(rawAttachments)
+          : [];
+
+      for (const [attKey, attVal] of entries) {
+        if (!attVal) continue;
+        const filename = attVal.filename || attVal.rawFilename || String(attKey) || 'embedded_attachment';
+        const rawFilename = attVal.rawFilename || attVal.filename || String(attKey) || null;
+        const description = attVal.description || '';
+        const contentByteLength =
+          attVal.content && typeof attVal.content.byteLength === 'number'
+            ? attVal.content.byteLength
+            : null;
+
+        const dedupKey = `catalog:${filename.toLowerCase()}`;
+        seenKeys.add(dedupKey);
+
+        items.push({
+          id: `att_catalog_${items.length + 1}`,
+          filename,
+          rawFilename,
+          description,
+          source: 'catalog-embedded-files',
+          pageNumber: null,
+          contentByteLength,
+          contentInspected: false,
+          inspectionStatus: 'UNINSPECTED_ATTACHMENT_CONTENT',
+        });
+      }
+    }
+  } catch {
+    // Continue with page annotations and raw catalog fallback
+  }
+
+  // 2. Include page-level FileAttachment annotations
+  for (const pageAtt of pageFileAttachments || []) {
+    items.push({
+      ...pageAtt,
+      id: pageAtt.id || `att_page_${items.length + 1}`,
+    });
+    if (pageAtt.filename) {
+      seenKeys.add(`page:${pageAtt.filename.toLowerCase()}`);
+    }
+  }
+
+  // 3. Fallback inspection of raw `/Filespec` dictionaries in case an attachment is referenced only via `/AF`
+  const filespecRegex = /<<[^>]*?\/Type\s*\/Filespec\b([\s\S]{0,600}?)>>/g;
+  let fsMatch;
+  while ((fsMatch = filespecRegex.exec(nonStreamPdfLatin1)) !== null) {
+    const dictBody = fsMatch[1] || '';
+    let filename = '';
+    const ufHex = /\/UF\s*<([0-9A-Fa-f\s]+)>/.exec(dictBody);
+    const ufLit = /\/UF\s*\(([^()\\]*(?:\\.[^()\\]*)*)\)/.exec(dictBody);
+    const fLit = /\/F\s*\(([^()\\]*(?:\\.[^()\\]*)*)\)/.exec(dictBody);
+    const fHex = /\/F\s*<([0-9A-Fa-f\s]+)>/.exec(dictBody);
+
+    if (ufHex) filename = decodePdfHexString(ufHex[1]);
+    else if (ufLit) filename = decodePdfLiteralString(ufLit[1]);
+    else if (fLit) filename = decodePdfLiteralString(fLit[1]);
+    else if (fHex) filename = decodePdfHexString(fHex[1]);
+
+    if (!filename) continue;
+    const lowerName = filename.toLowerCase();
+    if (seenKeys.has(`catalog:${lowerName}`) || seenKeys.has(`page:${lowerName}`) || seenKeys.has(`filespec:${lowerName}`)) {
+      continue;
+    }
+    seenKeys.add(`filespec:${lowerName}`);
+
+    let description = '';
+    const descHex = /\/Desc\s*<([0-9A-Fa-f\s]+)>/.exec(dictBody);
+    const descLit = /\/Desc\s*\(([^()\\]*(?:\\.[^()\\]*)*)\)/.exec(dictBody);
+    if (descHex) description = decodePdfHexString(descHex[1]);
+    else if (descLit) description = decodePdfLiteralString(descLit[1]);
+
+    items.push({
+      id: `att_filespec_${items.length + 1}`,
+      filename,
+      rawFilename: filename,
+      description,
+      source: 'associated-file-or-filespec',
+      pageNumber: null,
+      contentByteLength: null,
+      contentInspected: false,
+      inspectionStatus: 'UNINSPECTED_ATTACHMENT_CONTENT',
+    });
+  }
+
+  const isPortfolioCollection =
+    Boolean(metaInfo?.IsCollectionPresent) ||
+    /\/Type\s*\/Catalog\b[\s\S]{0,600}?\/Collection\b/.test(nonStreamPdfLatin1);
+  const hasAssociatedFiles = /\/AF\s*(?:\[|\d+\s+\d+\s+R\b)/.test(nonStreamPdfLatin1);
+
+  return {
+    isPortfolioCollection,
+    hasAssociatedFiles,
+    items,
+  };
+}
+
+/**
+ * Inspect raw PDF structure for incremental save revisions, `/Prev` trailer chains, `startxref` markers,
+ * cross-reference tables/streams, linearized PDF structures, and malformed revision anomalies.
+ */
+function inspectPdfRevisionStructure(dataBuffer, rawPdfLatin1, nonStreamPdfLatin1, metaInfo) {
+  const fileSize = dataBuffer.length;
+  const headerSlice = nonStreamPdfLatin1.slice(0, Math.min(fileSize, 4096));
+
+  // 1. Detect Linearized PDF dictionary near the beginning of the file
+  const hasLinearizedDict = /<<[\s\S]{0,500}?\/Linearized\s+\d/.test(headerSlice);
+  const isLinearized = Boolean(metaInfo?.IsLinearized) || hasLinearizedDict;
+  let linearizedDeclaredLength = null;
+  if (hasLinearizedDict) {
+    const lenMatch = /\/Linearized\s+\d[\s\S]{0,300}?\/L\s+(\d+)/.exec(headerSlice);
+    if (lenMatch) {
+      linearizedDeclaredLength = Number(lenMatch[1]);
+    }
+  }
+
+  // 2. Locate all `xref` tables and `/Type /XRef` cross-reference stream objects
+  const xrefTableOffsets = [];
+  const xrefTableRegex = /(?:^|[\r\n])\s*(xref)\s*[\r\n]/g;
+  let xm;
+  while ((xm = xrefTableRegex.exec(nonStreamPdfLatin1)) !== null) {
+    const kwOffset = xm.index + xm[0].indexOf('xref');
+    xrefTableOffsets.push(kwOffset);
+  }
+
+  const xrefStreamOffsets = [];
+  const xrefStreamRegex = /(\d+\s+\d+\s+obj)\b[\s\S]{0,320}?\/Type\s*\/XRef\b/g;
+  while ((xm = xrefStreamRegex.exec(nonStreamPdfLatin1)) !== null) {
+    xrefStreamOffsets.push(xm.index);
+  }
+
+  const totalXrefSectionCount = xrefTableOffsets.length + xrefStreamOffsets.length;
+
+  // 3. Locate all `%%EOF` markers (informational telemetry; never used alone as proof)
+  const eofOffsets = [];
+  const eofRegex = /%%EOF/g;
+  while ((xm = eofRegex.exec(nonStreamPdfLatin1)) !== null) {
+    eofOffsets.push(xm.index + xm[0].length);
+  }
+
+  // 4. Locate and validate all `startxref` tokens
+  const startxrefAllTokens = [];
+  const startxrefRegex = /\bstartxref(?:\s+([^\s%]+))?/g;
+  while ((xm = startxrefRegex.exec(nonStreamPdfLatin1)) !== null) {
+    const rawToken = xm[1] ?? '';
+    const isInt = /^\d+$/.test(rawToken);
+    startxrefAllTokens.push({
+      markerIndex: xm.index,
+      rawToken,
+      offset: isInt ? Number(rawToken) : null,
+    });
+  }
+
+  // 5. Locate and validate all `/Prev` entries in trailers or XRef stream dictionaries
+  const prevAllTokens = [];
+  const prevRegex = /\/Prev\s+([^\s/>\]<]+)/g;
+  while ((xm = prevRegex.exec(nonStreamPdfLatin1)) !== null) {
+    const rawToken = xm[1] ?? '';
+    const isInt = /^\d+$/.test(rawToken);
+    prevAllTokens.push({
+      markerIndex: xm.index,
+      rawToken,
+      offset: isInt ? Number(rawToken) : null,
+    });
+  }
+
+  // Helper to verify whether a byte offset points to a genuine `xref` table or `/Type /XRef` stream object
+  const isValidXrefTargetOffset = (offset, allowLinearizedZero = false) => {
+    if (allowLinearizedZero && isLinearized && offset === 0) {
+      return true;
+    }
+    if (!Number.isInteger(offset) || offset <= 0 || offset >= fileSize) {
+      return false;
+    }
+    const probe = nonStreamPdfLatin1.slice(offset, Math.min(fileSize, offset + 350)).trimStart();
+    if (/^xref\b/.test(probe)) {
+      return true;
+    }
+    if (/^\d+\s+\d+\s+obj\b[\s\S]{0,280}?\/Type\s*\/XRef\b/.test(probe)) {
+      return true;
+    }
+    return false;
+  };
+
+  // 6. Check for malformed / indeterminate revision structures
+  const anomalyReasons = [];
+
+  if (startxrefAllTokens.length === 0) {
+    anomalyReasons.push('Missing "startxref" marker in PDF trailer structure.');
+  }
+
+  for (const sx of startxrefAllTokens) {
+    if (sx.offset === null) {
+      anomalyReasons.push(`Malformed non-integer startxref token "${sx.rawToken}".`);
+    } else if (!isValidXrefTargetOffset(sx.offset, true)) {
+      anomalyReasons.push(
+        `startxref offset ${sx.offset} does not point to a valid xref table or /Type /XRef stream within the ${fileSize}-byte file.`
+      );
+    }
+  }
+
+  const seenPrevOffsets = new Set();
+  for (const pv of prevAllTokens) {
+    if (pv.offset === null) {
+      anomalyReasons.push(`Malformed non-integer trailer /Prev token "${pv.rawToken}".`);
+    } else if (!isValidXrefTargetOffset(pv.offset, false)) {
+      anomalyReasons.push(
+        `Trailer /Prev offset ${pv.offset} is out of bounds or does not point to a valid xref table or /Type /XRef stream.`
+      );
+    } else if (seenPrevOffsets.has(pv.offset)) {
+      anomalyReasons.push(`Cyclic or duplicate trailer /Prev offset (${pv.offset}) detected.`);
+    } else {
+      seenPrevOffsets.add(pv.offset);
+    }
+  }
+
+  if (!isLinearized && totalXrefSectionCount > 1 && prevAllTokens.length === 0 && startxrefAllTokens.length < totalXrefSectionCount) {
+    anomalyReasons.push(
+      `Found ${totalXrefSectionCount} cross-reference sections but missing matching startxref or trailer /Prev linkage.`
+    );
+  }
+
+  if (anomalyReasons.length > 0) {
+    return {
+      status: 'INDETERMINATE',
+      isLinearized,
+      confidence: 'LOW_UNCERTAIN',
+      revisionCount: null,
+      startxrefCount: startxrefAllTokens.length,
+      xrefSectionCount: totalXrefSectionCount,
+      prevCount: prevAllTokens.length,
+      eofCount: eofOffsets.length,
+      reason: `Malformed or inconsistent PDF revision structure: ${anomalyReasons.join(' ')}`,
+      earlierRevisionTexts: [],
+    };
+  }
+
+  // 7. Distinguish legitimate Linearized PDFs from Incremental Updates
+  if (isLinearized) {
+    const lengthMatchesDeclared =
+      linearizedDeclaredLength === null || Math.abs(fileSize - linearizedDeclaredLength) <= 64;
+    const isStandardLinearizedLayout =
+      startxrefAllTokens.length <= 2 &&
+      totalXrefSectionCount <= 2 &&
+      prevAllTokens.length <= 1 &&
+      lengthMatchesDeclared;
+
+    if (isStandardLinearizedLayout) {
+      return {
+        status: 'NOT_DETECTED',
+        isLinearized: true,
+        confidence: 'HIGH',
+        revisionCount: 1,
+        startxrefCount: startxrefAllTokens.length,
+        xrefSectionCount: totalXrefSectionCount,
+        prevCount: prevAllTokens.length,
+        eofCount: eofOffsets.length,
+        reason:
+          'Linearized PDF structure detected (first-page cross-reference section + main cross-reference section with matching /L file length); no post-linearization incremental updates detected.',
+        earlierRevisionTexts: [],
+      };
+    }
+
+    // Linearized PDF with extra incremental revisions appended after linearization
+    const boundaryOffset =
+      linearizedDeclaredLength && linearizedDeclaredLength < fileSize
+        ? linearizedDeclaredLength
+        : eofOffsets.length >= 2
+        ? eofOffsets[eofOffsets.length - 2]
+        : Math.floor(fileSize * 0.75);
+
+    const earlierText = extractReadableStringsFromPdfSegment(rawPdfLatin1.slice(0, boundaryOffset));
+    return {
+      status: 'DETECTED',
+      isLinearized: true,
+      confidence: 'HIGH',
+      revisionCount: Math.max(2, startxrefAllTokens.length - 1),
+      startxrefCount: startxrefAllTokens.length,
+      xrefSectionCount: totalXrefSectionCount,
+      prevCount: prevAllTokens.length,
+      eofCount: eofOffsets.length,
+      reason: `Linearized PDF has additional incremental revision(s) appended beyond the base linearized structure (${startxrefAllTokens.length} startxref markers, ${prevAllTokens.length} /Prev references).`,
+      earlierRevisionTexts: earlierText ? [{ revisionNumber: 1, text: earlierText }] : [],
+    };
+  }
+
+  // 8. Non-linearized PDF: check for incremental updates
+  const hasIncrementalRevisions =
+    prevAllTokens.length >= 1 || (startxrefAllTokens.length >= 2 && totalXrefSectionCount >= 2);
+
+  if (hasIncrementalRevisions) {
+    const revisionCount = Math.max(startxrefAllTokens.length, prevAllTokens.length + 1, 2);
+
+    // Extract readable text from all earlier revision byte segments (before the final revision)
+    const earlierRevisionTexts = [];
+    if (eofOffsets.length >= 2) {
+      let segStart = 0;
+      for (let rIdx = 0; rIdx < eofOffsets.length - 1; rIdx++) {
+        const segEnd = eofOffsets[rIdx];
+        const segLatin1 = rawPdfLatin1.slice(segStart, segEnd);
+        const extracted = extractReadableStringsFromPdfSegment(segLatin1);
+        if (extracted) {
+          earlierRevisionTexts.push({
+            revisionNumber: rIdx + 1,
+            text: extracted,
+          });
+        }
+        segStart = segEnd;
+      }
+    } else if (startxrefAllTokens.length >= 1) {
+      // Fallback: inspect up to the earliest /Prev xref table
+      const earliestPrev = Math.min(...prevAllTokens.map((p) => p.offset));
+      const segLatin1 = rawPdfLatin1.slice(0, earliestPrev);
+      const extracted = extractReadableStringsFromPdfSegment(segLatin1);
+      if (extracted) {
+        earlierRevisionTexts.push({
+          revisionNumber: 1,
+          text: extracted,
+        });
+      }
+    }
+
+    return {
+      status: 'DETECTED',
+      isLinearized: false,
+      confidence: 'HIGH',
+      revisionCount,
+      startxrefCount: startxrefAllTokens.length,
+      xrefSectionCount: totalXrefSectionCount,
+      prevCount: prevAllTokens.length,
+      eofCount: eofOffsets.length,
+      reason: `Detected ${revisionCount} PDF revisions linked via ${prevAllTokens.length} trailer /Prev reference(s) and ${startxrefAllTokens.length} startxref marker(s). Earlier revisions may retain historical or overwritten sensitive content.`,
+      earlierRevisionTexts,
+    };
+  }
+
+  return {
+    status: 'NOT_DETECTED',
+    isLinearized: false,
+    confidence: 'HIGH',
+    revisionCount: 1,
+    startxrefCount: startxrefAllTokens.length,
+    xrefSectionCount: totalXrefSectionCount,
+    prevCount: prevAllTokens.length,
+    eofCount: eofOffsets.length,
+    reason: 'Single cross-reference generation with no trailer /Prev chain or incremental updates detected.',
+    earlierRevisionTexts: [],
+  };
+}
+
+/**
+ * Perform complete P2.2 hidden-structure inspection (metadata, XMP, attachments, incremental revisions).
+ */
+async function inspectPdfHiddenStructures(pdfDoc, dataBuffer, pageFileAttachments) {
+  const rawPdfLatin1 = dataBuffer.toString('latin1');
+  const nonStreamPdfLatin1 = maskBinaryStreamsPreservingOffsets(rawPdfLatin1);
+
+  const metadata = await inspectPdfMetadataStructure(pdfDoc, rawPdfLatin1);
+  const attachments = await inspectPdfAttachmentStructure(
+    pdfDoc,
+    pageFileAttachments,
+    metadata.metaInfo,
+    nonStreamPdfLatin1
+  );
+  const revisions = inspectPdfRevisionStructure(
+    dataBuffer,
+    rawPdfLatin1,
+    nonStreamPdfLatin1,
+    metadata.metaInfo
+  );
+
+  return {
+    metadata,
+    attachments,
+    revisions,
   };
 }
 
@@ -437,7 +1122,7 @@ async function extractPageAnnotations(page, viewport, pageNum) {
  * Extract embedded text and bounding-box items from a PDF file.
  * Automatically falls back to Tesseract.js OCR for any page that has little/no embedded text,
  * AND runs hybrid OCR inspection on pages that contain both selectable text and embedded raster images.
- * Also inspects AcroForm widgets and visual annotations via `page.getAnnotations()`.
+ * Also inspects AcroForm widgets, visual annotations, and hidden PDF structures (metadata, attachments, revisions).
  *
  * @param {string} filePath - Path to the PDF file on disk
  * @param {object} options - { forceOcr: boolean }
@@ -483,9 +1168,11 @@ export async function extractPdfContent(filePath, options = {}) {
   const pages = [];
   const allUnsupportedAnnotations = [];
   const allLinkAnnotations = [];
+  const allPageFileAttachments = [];
   let usedOcrFallback = false;
   let usedPdfText = false;
   let ocrWorker = null;
+  let rawStructuralInspection = null;
 
   try {
     for (let pageNum = 1; pageNum <= numPages; pageNum++) {
@@ -507,10 +1194,12 @@ export async function extractPdfContent(filePath, options = {}) {
         unlocatableAnnotationTexts,
         unsupportedAnnotations,
         linkAnnotations,
+        fileAttachmentAnnotations,
       } = await extractPageAnnotations(page, viewport, pageNum);
 
       allUnsupportedAnnotations.push(...unsupportedAnnotations);
       allLinkAnnotations.push(...linkAnnotations);
+      allPageFileAttachments.push(...fileAttachmentAnnotations);
 
       // Convert PDF.js text items into normalized top-left coordinate items (PDF points)
       const textElements = [];
@@ -646,10 +1335,18 @@ export async function extractPdfContent(filePath, options = {}) {
         annotationCount: visualAnnotationElements.length + unsupportedAnnotations.length,
         unsupportedAnnotations,
         linkAnnotations,
+        fileAttachmentAnnotations,
         text: finalPageText,
         elements: finalElements,
       });
     }
+
+    // Perform P2.2 hidden PDF structure inspection (metadata, XMP, attachments, incremental revisions)
+    rawStructuralInspection = await inspectPdfHiddenStructures(
+      pdfDoc,
+      dataBuffer,
+      allPageFileAttachments
+    );
   } finally {
     if (ocrWorker) {
       try {
@@ -668,6 +1365,8 @@ export async function extractPdfContent(filePath, options = {}) {
     extractionMethod = 'ocr-fallback';
   }
 
+  const structuralAudit = buildStructuralAudit(rawStructuralInspection, null);
+
   return {
     pageCount: numPages,
     extractionMethod,
@@ -675,6 +1374,9 @@ export async function extractPdfContent(filePath, options = {}) {
     totalCharacters,
     unsupportedAnnotations: allUnsupportedAnnotations,
     linkAnnotations: allLinkAnnotations,
+    rawStructuralInspection,
+    structuralAudit,
     pages,
   };
 }
+

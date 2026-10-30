@@ -39,6 +39,12 @@ export function buildPrivacyAssessmentReport({
       ? Math.max(0, Math.min(100, Math.round(((detectedBefore - remainingCount) / detectedBefore) * 100)))
       : 100;
 
+  const structuralAudit =
+    documentRecord.structuralAudit || documentRecord.extraction?.structuralAudit || null;
+  const structuralWarningCount = Array.isArray(structuralAudit?.warnings)
+    ? structuralAudit.warnings.length
+    : 0;
+
   let summaryText = '';
   if (detectedBefore === 0) {
     summaryText =
@@ -47,6 +53,10 @@ export function buildPrivacyAssessmentReport({
     summaryText = `${removedCount} of ${detectedBefore} detected sensitive item(s) were permanently redacted and verified as no longer detectable via PDF text extraction or OCR.`;
   } else {
     summaryText = `${removedCount} of ${selectedCount} selected item(s) were permanently removed. However, ${remainingCount} sensitive item(s) remain detectable in the exported PDF (for example, items left unselected during selective redaction).`;
+  }
+
+  if (structuralWarningCount > 0) {
+    summaryText += ` Note: Structural inspection of the uploaded PDF flagged ${structuralWarningCount} hidden-structure warning(s) (such as metadata PII, uninspected embedded attachments, or incremental revisions).`;
   }
 
   return {
@@ -71,6 +81,7 @@ export function buildPrivacyAssessmentReport({
     },
     removedSensitiveItems: verificationResult.removedItems || [],
     remainingSensitiveItems: remainingItems,
+    ...(structuralAudit ? { structuralAudit } : {}),
     verificationDetails: {
       methodsUsed: verificationResult.methodsUsed,
       selectedStillDetectableCount: verificationResult.selectedStillDetectableCount,
@@ -84,3 +95,4 @@ export function buildPrivacyAssessmentReport({
     },
   };
 }
+

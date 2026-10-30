@@ -523,6 +523,354 @@ export function findBoundingBoxForMatch(matchText, page, usedBoxKeys) {
 }
 
 /**
+ * Mask a sensitive value for safe display in warning messages and logs without exposing the full raw string.
+ */
+export function maskSensitiveValue(value) {
+  const str = String(value || '').trim();
+  if (str.length <= 4) return '****';
+  return `${str.slice(0, 2)}${'*'.repeat(Math.min(8, str.length - 4))}${str.slice(-2)}`;
+}
+
+/**
+ * Scan an arbitrary text string (such as a PDF metadata value, XMP text, attachment filename, or
+ * earlier incremental revision stream) using DocShield's sensitive-data detection patterns.
+ *
+ * Returns resolved non-overlapping matches without fabricating page coordinates.
+ */
+export function scanTextForSensitiveMatches(text, allowedCategories = null) {
+  const rawInput = String(text || '');
+  if (!rawInput.trim()) return [];
+
+  const categorySet =
+    Array.isArray(allowedCategories) && allowedCategories.length > 0
+      ? new Set(allowedCategories)
+      : new Set(Object.keys(SENSITIVE_CATEGORIES));
+
+  // Scan both the raw string and an underscore-normalized variant (so filenames like
+  // "pan_ABCDE1234F_scan.pdf" or "aadhaar_4829-7301-9482.txt" match word-boundary regexes).
+  const variants = [rawInput];
+  if (rawInput.includes('_')) {
+    variants.push(rawInput.replace(/_/g, ' '));
+  }
+
+  const rawCandidates = [];
+  const seenSpanKeys = new Set();
+
+  for (const variantText of variants) {
+    for (const pattern of DETECTION_PATTERNS) {
+      if (!categorySet.has(pattern.category)) continue;
+      // Avoid breaking email addresses that legitimately contain underscores when scanning the underscore-stripped variant
+      if (variantText !== rawInput && pattern.category === 'EMAIL_ADDRESS') continue;
+
+      const regex = new RegExp(pattern.regex.source, pattern.regex.flags);
+      let match;
+      while ((match = regex.exec(variantText)) !== null) {
+        const rawMatch = match[0];
+        const matchedText = rawMatch.trim();
+        if (!matchedText) continue;
+
+        const matchStart = match.index + rawMatch.indexOf(matchedText);
+        const matchEnd = matchStart + matchedText.length;
+        const spanKey = `${pattern.category}:${matchStart}:${matchEnd}:${matchedText.toLowerCase()}`;
+        if (seenSpanKeys.has(spanKey)) continue;
+        seenSpanKeys.add(spanKey);
+
+        rawCandidates.push({
+          start: matchStart,
+          end: matchEnd,
+          length: matchedText.length,
+          text: matchedText,
+          pattern,
+        });
+      }
+    }
+  }
+
+  const resolved = resolveOverlappingCandidates(rawCandidates, rawInput);
+  return resolved.map((cand) => ({
+    text: cand.text,
+    maskedText: maskSensitiveValue(cand.text),
+    category: cand.pattern.category,
+    categoryLabel: cand.pattern.label,
+    confidence: cand.pattern.confidence,
+    statusNote: cand.pattern.statusNote,
+  }));
+}
+
+/**
+ * Build the complete `structuralAudit` object from raw structural inspection data extracted from the PDF,
+ * scanning metadata fields, custom Info fields, XMP metadata, attachment names/descriptions, and earlier
+ * incremental revision streams for sensitive information.
+ *
+ * Metadata and structural detections are kept strictly separate from normal page-coordinate detections
+ * and never invent page coordinates.
+ */
+export function buildStructuralAudit(rawStructuralInspection, allowedCategories = null) {
+  const raw = rawStructuralInspection || {};
+  const rawMeta = raw.metadata || {};
+  const rawAttachments = raw.attachments || {};
+  const rawRevisions = raw.revisions || {};
+
+  const metadataDetections = [];
+  let metaCounter = 1;
+  const fieldsWithSensitiveData = new Set();
+
+  const recordMetaMatches = (fieldValue, fieldName, sourceType) => {
+    if (!fieldValue || typeof fieldValue !== 'string') return [];
+    const matches = scanTextForSensitiveMatches(fieldValue, allowedCategories);
+    const seenInField = new Set();
+    const recordedForField = [];
+
+    for (const m of matches) {
+      const dedupKey = `${fieldName}:${m.category}:${m.text.toLowerCase()}`;
+      if (seenInField.has(dedupKey)) continue;
+      seenInField.add(dedupKey);
+      fieldsWithSensitiveData.add(fieldName);
+
+      const detObj = {
+        id: `meta_det_${metaCounter++}`,
+        text: m.text,
+        maskedText: m.maskedText,
+        category: m.category,
+        categoryLabel: m.categoryLabel,
+        confidence: m.confidence,
+        source: sourceType,
+        metadataField: fieldName,
+        pageNumber: null,
+        boundingBox: null,
+        redactionReady: false,
+        detectionStatus: `${m.statusNote} (detected in ${sourceType} field "${fieldName}"; document-level metadata has no page coordinates)`,
+      };
+      metadataDetections.push(detObj);
+      recordedForField.push(detObj);
+    }
+    return recordedForField;
+  };
+
+  // 1. Scan standard Info dictionary fields
+  const standardFields = rawMeta.standardFields || {
+    Title: null,
+    Author: null,
+    Subject: null,
+    Keywords: null,
+    Creator: null,
+    Producer: null,
+    CreationDate: null,
+    ModDate: null,
+  };
+
+  for (const [fieldKey, fieldVal] of Object.entries(standardFields)) {
+    if (typeof fieldVal === 'string' && fieldVal.trim()) {
+      recordMetaMatches(fieldVal, fieldKey, 'pdf-metadata');
+    }
+  }
+
+  // 2. Scan custom Info dictionary fields
+  const customFields = rawMeta.customFields || {};
+  for (const [customKey, customVal] of Object.entries(customFields)) {
+    if (typeof customVal === 'string' && customVal.trim()) {
+      recordMetaMatches(customVal, `Custom:${customKey}`, 'pdf-custom-metadata');
+    }
+  }
+
+  // 3. Scan XMP metadata text
+  if (rawMeta.xmpText && typeof rawMeta.xmpText === 'string' && rawMeta.xmpText.trim()) {
+    recordMetaMatches(rawMeta.xmpText, 'XMP', 'pdf-xmp-metadata');
+  }
+
+  // 4. Inspect attachments and scan attachment filenames/descriptions (without scanning or executing file contents)
+  const rawAttachmentItems = Array.isArray(rawAttachments.items) ? rawAttachments.items : [];
+  const enrichedAttachmentItems = rawAttachmentItems.map((att, idx) => {
+    const fnMatches = recordMetaMatches(
+      att.filename || att.rawFilename || '',
+      `AttachmentFilename:${att.id || idx + 1}`,
+      'pdf-attachment-metadata'
+    );
+    const descMatches = recordMetaMatches(
+      [att.description, att.annotationContents].filter(Boolean).join(' '),
+      `AttachmentDescription:${att.id || idx + 1}`,
+      'pdf-attachment-metadata'
+    );
+
+    const sensitiveMetadataMatches = [...fnMatches, ...descMatches].map((d) => ({
+      id: d.id,
+      text: d.text,
+      maskedText: d.maskedText,
+      category: d.category,
+      categoryLabel: d.categoryLabel,
+      metadataField: d.metadataField,
+    }));
+
+    return {
+      id: att.id || `att_${idx + 1}`,
+      filename: att.filename || 'unnamed_attachment',
+      rawFilename: att.rawFilename || att.filename || null,
+      description: att.description || null,
+      source: att.source || 'catalog-embedded-files',
+      pageNumber: att.pageNumber ?? null,
+      contentByteLength: att.contentByteLength ?? null,
+      contentInspected: false,
+      inspectionStatus: 'UNINSPECTED_ATTACHMENT_CONTENT',
+      hasSensitiveFilenameOrDescription: sensitiveMetadataMatches.length > 0,
+      sensitiveMetadataMatches,
+      warning:
+        'Embedded attachment content was not automatically extracted or scanned; uninspected embedded files cannot be assumed safe.',
+    };
+  });
+
+  // 5. Inspect incremental revisions and scan earlier revision bodies when incremental updates are detected
+  const historicalDetections = [];
+  let revDetCounter = 1;
+  if (rawRevisions.status === 'DETECTED' && Array.isArray(rawRevisions.earlierRevisionTexts)) {
+    const seenHist = new Set();
+    for (const revEntry of rawRevisions.earlierRevisionTexts) {
+      const revNum = revEntry.revisionNumber || 1;
+      const matches = scanTextForSensitiveMatches(revEntry.text || '', allowedCategories);
+      for (const m of matches) {
+        const key = `${revNum}:${m.category}:${m.text.toLowerCase()}`;
+        if (seenHist.has(key)) continue;
+        seenHist.add(key);
+
+        historicalDetections.push({
+          id: `rev_det_${revDetCounter++}`,
+          text: m.text,
+          maskedText: m.maskedText,
+          category: m.category,
+          categoryLabel: m.categoryLabel,
+          confidence: m.confidence,
+          source: 'pdf-incremental-revision',
+          revisionNumber: revNum,
+          pageNumber: null,
+          boundingBox: null,
+          redactionReady: false,
+          detectionStatus: `${m.statusNote} (detected inside earlier incremental PDF revision #${revNum})`,
+        });
+      }
+    }
+  }
+
+  // 6. Build structured warnings without exposing full raw sensitive strings in warning messages
+  const warnings = [];
+
+  if (metadataDetections.length > 0) {
+    const fieldList = Array.from(fieldsWithSensitiveData).join(', ');
+    warnings.push({
+      code: 'METADATA_SENSITIVE_DATA_DETECTED',
+      severity: 'HIGH',
+      section: 'metadata',
+      message: `Detected ${metadataDetections.length} sensitive item(s) inside hidden PDF/attachment metadata fields (${fieldList}). Metadata items do not have page coordinates and require metadata sanitization.`,
+    });
+  }
+
+  if (enrichedAttachmentItems.length > 0) {
+    warnings.push({
+      code: 'UNINSPECTED_EMBEDDED_ATTACHMENTS',
+      severity: 'HIGH',
+      section: 'attachments',
+      message: `PDF contains ${enrichedAttachmentItems.length} embedded attachment(s) or FileAttachment annotation(s) whose binary/file contents were not automatically extracted or scanned. Do not assume embedded attachments are free of sensitive data.`,
+    });
+  }
+
+  if (rawAttachments.isPortfolioCollection) {
+    warnings.push({
+      code: 'PDF_PORTFOLIO_COLLECTION_DETECTED',
+      severity: 'HIGH',
+      section: 'attachments',
+      message:
+        'PDF contains a /Collection (PDF Portfolio) dictionary that may package multiple hidden documents or files.',
+    });
+  }
+
+  if (rawAttachments.hasAssociatedFiles && enrichedAttachmentItems.length === 0) {
+    warnings.push({
+      code: 'ASSOCIATED_FILES_DETECTED',
+      severity: 'MEDIUM',
+      section: 'attachments',
+      message: 'PDF contains an /AF (Associated Files) structure that may reference embedded file specifications.',
+    });
+  }
+
+  if (rawRevisions.status === 'DETECTED') {
+    warnings.push({
+      code: 'INCREMENTAL_REVISIONS_DETECTED',
+      severity: 'HIGH',
+      section: 'revisions',
+      message:
+        rawRevisions.reason ||
+        'PDF contains multiple incremental save revisions. Earlier revisions in the raw file body may retain deleted or superseded sensitive information.',
+    });
+  } else if (rawRevisions.status === 'INDETERMINATE') {
+    warnings.push({
+      code: 'INDETERMINATE_REVISION_STRUCTURE',
+      severity: 'MEDIUM',
+      section: 'revisions',
+      message:
+        rawRevisions.reason ||
+        'PDF cross-reference / trailer revision structure is malformed or inconsistent; incremental update history could not be verified as clean.',
+    });
+  }
+
+  if (historicalDetections.length > 0) {
+    warnings.push({
+      code: 'HISTORICAL_REVISION_SENSITIVE_DATA_DETECTED',
+      severity: 'HIGH',
+      section: 'revisions',
+      message: `Detected ${historicalDetections.length} sensitive item(s) retained inside earlier incremental PDF revision stream(s).`,
+    });
+  }
+
+  const populatedFieldNames = rawMeta.populatedFieldNames || [];
+
+  return {
+    hasHiddenStructureRisks: warnings.length > 0,
+    metadata: {
+      hasInfoDictionary: Boolean(rawMeta.hasInfoDictionary),
+      hasXmpMetadata: Boolean(rawMeta.hasXmpMetadata),
+      standardFields,
+      customFields,
+      xmpPresent: Boolean(rawMeta.hasXmpMetadata),
+      xmpLength: rawMeta.xmpLength || 0,
+      populatedFieldNames,
+      sensitiveFieldCount: fieldsWithSensitiveData.size,
+      totalSensitiveMatches: metadataDetections.length,
+    },
+    metadataDetections,
+    attachments: {
+      hasAttachments:
+        enrichedAttachmentItems.length > 0 ||
+        Boolean(rawAttachments.isPortfolioCollection) ||
+        Boolean(rawAttachments.hasAssociatedFiles),
+      isPortfolioCollection: Boolean(rawAttachments.isPortfolioCollection),
+      hasAssociatedFiles: Boolean(rawAttachments.hasAssociatedFiles),
+      totalCount: enrichedAttachmentItems.length,
+      uninspectedCount: enrichedAttachmentItems.length,
+      status:
+        enrichedAttachmentItems.length > 0
+          ? 'ATTACHMENTS_DETECTED_UNINSPECTED'
+          : rawAttachments.isPortfolioCollection
+          ? 'PORTFOLIO_COLLECTION_DETECTED'
+          : 'NONE_DETECTED',
+      items: enrichedAttachmentItems,
+    },
+    revisions: {
+      status: rawRevisions.status || 'INDETERMINATE',
+      incrementalUpdatesDetected:
+        rawRevisions.status === 'DETECTED' ? true : rawRevisions.status === 'NOT_DETECTED' ? false : null,
+      isLinearized: Boolean(rawRevisions.isLinearized),
+      confidence: rawRevisions.confidence || 'LOW_UNCERTAIN',
+      revisionCount: rawRevisions.revisionCount ?? null,
+      startxrefCount: rawRevisions.startxrefCount ?? 0,
+      xrefSectionCount: rawRevisions.xrefSectionCount ?? 0,
+      prevCount: rawRevisions.prevCount ?? 0,
+      eofCount: rawRevisions.eofCount ?? 0,
+      reason: rawRevisions.reason || 'Revision inspection was not performed.',
+      historicalDetections,
+    },
+    warnings,
+  };
+}
+
+/**
  * Run sensitive information detection across all extracted pages of a document.
  *
  * @param {object} extractionResult - Output from extractPdfContent()
@@ -610,6 +958,10 @@ export function detectSensitiveInfo(extractionResult, allowedCategories = null, 
 
   const unsupportedAnnotations = extractionResult.unsupportedAnnotations || [];
   const linkAnnotations = extractionResult.linkAnnotations || [];
+  const structuralAudit = buildStructuralAudit(
+    extractionResult.rawStructuralInspection || extractionResult.structuralAudit,
+    allowedCategories
+  );
 
   return {
     totalDetected: detectedItems.length,
@@ -617,7 +969,9 @@ export function detectSensitiveInfo(extractionResult, allowedCategories = null, 
     disclaimer:
       'Automated pattern matching identifies common sensitive formats but cannot guarantee detection of every context-dependent personal detail. Uncertain detections are marked with LOW_UNCERTAIN confidence for human review.',
     items: detectedItems,
+    structuralAudit,
     ...(unsupportedAnnotations.length > 0 ? { unsupportedAnnotations } : {}),
     ...(linkAnnotations.length > 0 ? { linkAnnotations } : {}),
   };
 }
+
