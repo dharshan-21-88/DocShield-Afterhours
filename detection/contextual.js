@@ -82,14 +82,14 @@ const QUASI_IDENTIFIER_PATTERNS = [
     type: 'OCCUPATION_ROLE',
     categoryLabel: QUASI_IDENTIFIER_TYPES.OCCUPATION_ROLE,
     specificity: 'HIGH',
-    regex: /\b(?:Dean|Director(?:\s+General)?|Registrar|Vice[- ]Chancellor|Head\s+of\s+Department|HOD|Chief\s+(?:Executive|Medical|Technology|Financial)\s+Officer|Lead\s+(?:Architect|Scientist|Engineer)|Senior\s+(?:Consultant|Registrar|Surgeon|Lecturer)|Associate\s+Professor|Professor|Assistant\s+Professor)\b(?:\s+of\s+[A-Z][a-zA-Z\s]+)?/gi,
+    regex: /\b(?:Dean|Director(?:\s+General)?|Registrar|Vice[- ]Chancellor|Head\s+of\s+Department|HOD|Chief\s+(?:Executive|Medical|Technology|Financial)\s+Officer|Lead\s+(?:Architect|Scientist|Engineer)|Senior\s+(?:Consultant|Registrar|Surgeon|Lecturer)(?:\s+(?:Surgeon|Physician|Specialist))?|Associate\s+Professor|Professor|Assistant\s+Professor)\b(?:\s+of\s+[A-Z][a-zA-Z]{2,25}(?:\s+[A-Z][a-zA-Z]{2,25})?)?/gi,
     description: 'Executive, academic, or medical leadership role',
   },
   {
     type: 'ORGANIZATION',
     categoryLabel: QUASI_IDENTIFIER_TYPES.ORGANIZATION,
     specificity: 'MEDIUM',
-    regex: /\b(?:[A-Z][A-Za-z0-9&.-]+(?:\s+[A-Z][A-Za-z0-9&.-]+)*\s+(?:University|Institute\s+of\s+Technology|Hospital|Medical\s+Center|College|Foundation|Corporation|Pvt\.?\s*Ltd\.?|Limited))\b/g,
+    regex: /\b(?:[A-Z][A-Za-z0-9&.-]+(?:\s+[A-Z][A-Za-z0-9&.-]+)*\s+(?:University|Institute\s+of\s+Technology|Hospital|Medical\s+Center|College|Foundation|Corporation|Pvt\.?\s*Ltd\.?|Limited))\b(?!\s+(?:Road|Rd|Street|St|Avenue|Ave|Lane|Cross))/g,
     description: 'Named institutional, corporate, or healthcare entity',
   },
   {
@@ -103,7 +103,7 @@ const QUASI_IDENTIFIER_PATTERNS = [
     type: 'GEOGRAPHIC_LOCATION',
     categoryLabel: QUASI_IDENTIFIER_TYPES.GEOGRAPHIC_LOCATION,
     specificity: 'MEDIUM',
-    regex: /\b(?:(?:Bengaluru|Bangalore|Mumbai|Delhi|Chennai|Hyderabad|Kolkata|Pune|Ahmedabad|Jaipur)\s*(?:-\s*\d{6}|\b\d{6}\b)?|\b\d{6}\b|[A-Z][a-z]+\s+(?:District|Nagar|Layout|Sector\s*\d+|Block\s*[A-Z0-9]+))\b/g,
+    regex: /\b(?:(?:Bengaluru|Bangalore|Mumbai|Delhi|Chennai|Hyderabad|Kolkata|Pune|Ahmedabad|Jaipur)(?:\s*(?:-\s*\d{6}|\b\d{6}\b))?|(?:PIN(?:\s*code)?|Postal(?:\s*Code)?)\s*[:=-]?\s*[1-9]\d{5}|[A-Z][a-z]+\s+(?:District|Nagar|Layout|Sector\s*\d+|Block\s*[A-Z0-9]+))\b/gi,
     description: 'Geographic locality, city, district, or postal PIN code',
   },
 ];
