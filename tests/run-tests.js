@@ -1454,6 +1454,235 @@ async function runTests() {
         }
       },
     },
+
+    // =========================================================================
+    // P1 SECURITY CHALLENGE: EMBEDDED IMAGES IN HYBRID PDFs
+    // =========================================================================
+    {
+      name: '[P1 Hybrid Test 1] Hybrid PDF (Selectable Text + Embedded Image with PAN & Phone): Extraction, Non-Duplicate Detection, Automatic Redaction & OCR Verification',
+      fn: async () => {
+        // 1. Render an embedded PNG image containing ONLY the fictional PAN (ABCDE1234F) and Phone (+91 9876543210)
+        const imgCanvas = createCanvas(900, 260);
+        const imgCtx = imgCanvas.getContext('2d');
+        imgCtx.fillStyle = '#FFFFFF';
+        imgCtx.fillRect(0, 0, 900, 260);
+        imgCtx.strokeStyle = '#1E293B';
+        imgCtx.lineWidth = 3;
+        imgCtx.strokeRect(10, 10, 880, 240);
+
+        imgCtx.fillStyle = '#000000';
+        imgCtx.font = 'bold 30px sans-serif';
+        imgCtx.fillText('EMBEDDED IDENTITY STAMP IMAGE (FICTIONAL)', 35, 65);
+        imgCtx.font = '28px sans-serif';
+        imgCtx.fillText('Income Tax PAN: ABCDE1234F', 35, 135);
+        imgCtx.fillText('Emergency Phone: +91 9876543210', 35, 200);
+        const embeddedPngBuffer = imgCanvas.toBuffer('image/png');
+
+        // 2. Create a PDF with > 150 characters of ordinary selectable text (including a selectable email & reg no)
+        //    AND embed the PNG image in the lower half of the page.
+        const pdfDoc = await PDFDocument.create();
+        const page = pdfDoc.addPage([595.28, 841.89]);
+        const fontBold = await pdfDoc.embedFont(StandardFonts.HelveticaBold);
+        const fontRegular = await pdfDoc.embedFont(StandardFonts.Helvetica);
+
+        page.drawText('HYBRID UNIVERSITY CLEARANCE CERTIFICATE (FICTIONAL)', {
+          x: 50,
+          y: 770,
+          size: 15,
+          font: fontBold,
+        });
+        page.drawText(
+          'This certificate confirms that the student listed below has completed all laboratory coursework',
+          { x: 50, y: 735, size: 11, font: fontRegular }
+        );
+        page.drawText(
+          'and departmental library requirements for the academic semester without any pending dues.',
+          { x: 50, y: 715, size: 11, font: fontRegular }
+        );
+        page.drawText('Student Registration No: REG-2026-HY-0777', {
+          x: 50,
+          y: 680,
+          size: 12,
+          font: fontRegular,
+        });
+        page.drawText('Institutional Email: hybrid.student.demo@fictional-univ.edu', {
+          x: 50,
+          y: 650,
+          size: 12,
+          font: fontRegular,
+        });
+
+        // Embed the PNG image at bottom-left PDF coordinates (x=50, y=380, width=450, height=130)
+        // In top-left PDF coordinates, this spans y = [841.89 - 510 = 331.89] to [841.89 - 380 = 461.89]
+        const pngEmbed = await pdfDoc.embedPng(embeddedPngBuffer);
+        page.drawImage(pngEmbed, {
+          x: 50,
+          y: 380,
+          width: 450,
+          height: 130,
+        });
+
+        const hybridBuffer = Buffer.from(await pdfDoc.save());
+
+        // 3. Upload the hybrid PDF and confirm extraction identifies the document and page as 'hybrid'
+        const up = await uploadCustomPdfBuffer(hybridBuffer, 'fictional_hybrid_document.pdf');
+        assert.strictEqual(up.status, 201, 'Hybrid PDF upload must succeed with HTTP 201');
+        assert.strictEqual(
+          up.body.extraction.extractionMethod,
+          'hybrid',
+          `Expected extractionMethod to be "hybrid", got "${up.body.extraction.extractionMethod}"`
+        );
+        assert.strictEqual(up.body.extraction.usedOcrFallback, true, 'Hybrid PDF must report usedOcrFallback: true');
+        assert.strictEqual(up.body.extraction.pages[0].method, 'hybrid', 'Page 1 method must be "hybrid"');
+        assert.ok(
+          up.body.extraction.totalCharacters > 150,
+          `Expected > 150 extracted characters, got ${up.body.extraction.totalCharacters}`
+        );
+
+        const docId = up.body.documentId;
+
+        // 4. Run detection and verify both image-only items AND selectable-text items are detected without duplication
+        const detRes = await fetch(`${baseUrl}/api/detect`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ documentId: docId }),
+        });
+        const detBody = await detRes.json();
+        assert.strictEqual(detRes.status, 200);
+
+        // Confirm image-only PAN (ABCDE1234F) is detected with valid boundingBox inside the embedded image region (y > 300pt)
+        const panMatches = detBody.items.filter((i) => i.text === 'ABCDE1234F');
+        assert.strictEqual(panMatches.length, 1, 'Image-only PAN ABCDE1234F must be detected exactly once');
+        assert.strictEqual(panMatches[0].category, 'NATIONAL_ID_PAN');
+        assert.ok(panMatches[0].boundingBox, 'Image-only PAN must have a valid boundingBox');
+        assert.ok(
+          panMatches[0].boundingBox.y > 300 && panMatches[0].boundingBox.y < 470,
+          `Image-only PAN boundingBox.y (${panMatches[0].boundingBox.y}) must map to the embedded image region (~330..460pt)`
+        );
+
+        // Confirm image-only Phone (+91 9876543210) is detected with valid boundingBox inside the embedded image region
+        const phoneMatches = detBody.items.filter(
+          (i) => i.category === 'PHONE_NUMBER' && i.text.replace(/\s+/g, '') === '+919876543210'
+        );
+        assert.strictEqual(phoneMatches.length, 1, 'Image-only phone +91 9876543210 must be detected exactly once');
+        assert.ok(phoneMatches[0].boundingBox, 'Image-only phone must have a valid boundingBox');
+        assert.ok(
+          phoneMatches[0].boundingBox.y > 300 && phoneMatches[0].boundingBox.y < 470,
+          `Image-only phone boundingBox.y (${phoneMatches[0].boundingBox.y}) must map to the embedded image region (~330..460pt)`
+        );
+
+        // Confirm ordinary selectable-text detections (REG-2026-HY-0777 and hybrid.student.demo@fictional-univ.edu)
+        // are NOT duplicated by the full-page OCR pass
+        const regMatches = detBody.items.filter((i) => i.text === 'REG-2026-HY-0777');
+        const emailMatches = detBody.items.filter((i) => i.text === 'hybrid.student.demo@fictional-univ.edu');
+        assert.strictEqual(
+          regMatches.length,
+          1,
+          `Selectable-text registration number must not be duplicated by OCR, found ${regMatches.length}`
+        );
+        assert.strictEqual(
+          emailMatches.length,
+          1,
+          `Selectable-text email address must not be duplicated by OCR, found ${emailMatches.length}`
+        );
+        assert.strictEqual(detBody.totalDetected, 4, `Expected exactly 4 total detections on hybrid page, got ${detBody.totalDetected}`);
+
+        // 5. Run automatic redaction and confirm all 4 items (2 text + 2 embedded-image) are redacted
+        const redRes = await fetch(`${baseUrl}/api/redact`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ documentId: docId, mode: 'automatic' }),
+        });
+        const redBody = await redRes.json();
+        assert.strictEqual(redRes.status, 200);
+        assert.strictEqual(redBody.selectedForRedactionCount, 4);
+
+        // 6. Run post-redaction verification with OCR enabled and confirm neither image-based item remains detectable
+        const verRes = await fetch(`${baseUrl}/api/verify`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ documentId: docId, runOcrCheck: true }),
+        });
+        const verBody = await verRes.json();
+        assert.strictEqual(verRes.status, 200);
+        assert.strictEqual(
+          verBody.verification.selectedStillDetectableCount,
+          0,
+          `Expected 0 selected items remaining after hybrid PDF redaction, got: ${JSON.stringify(verBody.verification.selectedStillDetectable)}`
+        );
+        assert.strictEqual(verBody.verification.successfullyRemovedCount, 4);
+      },
+    },
+    {
+      name: '[P1 Hybrid Test 2] Selective Redaction of Only Embedded-Image Detections in a Hybrid PDF',
+      fn: async () => {
+        const imgCanvas = createCanvas(800, 180);
+        const imgCtx = imgCanvas.getContext('2d');
+        imgCtx.fillStyle = '#FFFFFF';
+        imgCtx.fillRect(0, 0, 800, 180);
+        imgCtx.fillStyle = '#000000';
+        imgCtx.font = '28px sans-serif';
+        imgCtx.fillText('Stamped PAN: ABCDE1234F', 30, 75);
+        imgCtx.fillText('Stamped Mobile: +91 9876543210', 30, 135);
+        const pngBuf = imgCanvas.toBuffer('image/png');
+
+        const pdfDoc = await PDFDocument.create();
+        const page = pdfDoc.addPage([595.28, 841.89]);
+        const font = await pdfDoc.embedFont(StandardFonts.Helvetica);
+        page.drawText(
+          'SELECTIVE HYBRID REDACTION TEST DOCUMENT WITH MORE THAN ONE HUNDRED AND FIFTY CHARACTERS OF ORDINARY SELECTABLE TEXT ON THE PAGE.',
+          { x: 50, y: 750, size: 10, font }
+        );
+        page.drawText('Selectable Email: keep.visible@fictional-univ.edu', { x: 50, y: 710, size: 12, font });
+        const pngEmbed = await pdfDoc.embedPng(pngBuf);
+        page.drawImage(pngEmbed, { x: 50, y: 420, width: 400, height: 90 });
+
+        const buf = Buffer.from(await pdfDoc.save());
+        const up = await uploadCustomPdfBuffer(buf, 'selective_hybrid.pdf');
+        assert.strictEqual(up.status, 201);
+        const docId = up.body.documentId;
+
+        const detRes = await fetch(`${baseUrl}/api/detect`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ documentId: docId }),
+        });
+        const detBody = await detRes.json();
+        assert.strictEqual(detRes.status, 200);
+
+        const imageItemIds = detBody.items
+          .filter((i) => i.category === 'NATIONAL_ID_PAN' || i.category === 'PHONE_NUMBER')
+          .map((i) => i.id);
+        assert.strictEqual(imageItemIds.length, 2, 'Must find both image-based items for selective redaction');
+
+        // Selectively redact ONLY the 2 embedded-image items, leaving the selectable email unredacted
+        const redRes = await fetch(`${baseUrl}/api/redact`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            documentId: docId,
+            mode: 'selective',
+            selectedItemIds: imageItemIds,
+          }),
+        });
+        assert.strictEqual(redRes.status, 200);
+
+        const verRes = await fetch(`${baseUrl}/api/verify`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ documentId: docId, runOcrCheck: true }),
+        });
+        const verBody = await verRes.json();
+        assert.strictEqual(verRes.status, 200);
+        assert.strictEqual(verBody.verification.successfullyRemovedCount, 2, 'Both image-based items must be verified removed');
+        assert.strictEqual(verBody.verification.selectedStillDetectableCount, 0);
+        assert.strictEqual(
+          verBody.verification.remainingItems.some((r) => r.text === 'keep.visible@fictional-univ.edu'),
+          true,
+          'Unselected selectable-text email must remain visible and be reported in remainingItems'
+        );
+      },
+    },
   ];
 
   const results = testDefinitions.map((t) => ({

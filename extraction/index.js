@@ -56,6 +56,102 @@ export async function renderPageToCanvas(page, scale = 2.0) {
   };
 }
 
+const RASTER_IMAGE_OPERATORS = new Set(
+  [
+    pdfjsLib.OPS?.paintImageXObject,
+    pdfjsLib.OPS?.paintInlineImageXObject,
+    pdfjsLib.OPS?.paintInlineImageXObjectGroup,
+    pdfjsLib.OPS?.paintImageXObjectRepeat,
+    pdfjsLib.OPS?.paintImageMaskXObject,
+    pdfjsLib.OPS?.paintImageMaskXObjectGroup,
+    pdfjsLib.OPS?.paintImageMaskXObjectRepeat,
+    pdfjsLib.OPS?.beginInlineImage,
+  ].filter((op) => typeof op === 'number')
+);
+
+/**
+ * Inspect a PDF.js page's operator list to determine whether the page paints
+ * any embedded or inline raster images.
+ */
+async function detectEmbeddedImagesOnPage(page) {
+  const opList = await page.getOperatorList();
+  const fnArray = opList?.fnArray || [];
+  let imageOperatorCount = 0;
+
+  for (let i = 0; i < fnArray.length; i++) {
+    if (RASTER_IMAGE_OPERATORS.has(fnArray[i])) {
+      imageOperatorCount++;
+    }
+  }
+
+  return {
+    hasEmbeddedImages: imageOperatorCount > 0,
+    imageOperatorCount,
+  };
+}
+
+/**
+ * Normalize text for token comparison between selectable PDF text and OCR output.
+ */
+function normalizeComparableText(str) {
+  return (str || '').replace(/^[,.;:()[\]"']+|[,.;:()[\]"']+$/g, '').replace(/\s+/g, ' ').trim().toLowerCase();
+}
+
+/**
+ * Determine whether an OCR element (`ocr` word or `ocr-line`) spatially overlaps
+ * with an existing selectable `pdf-text` element on the same page that already contains
+ * the same text content.
+ *
+ * Why spatial + textual comparison?
+ * - If we only checked text equality across the page, a legitimate duplicate value inside an
+ *   embedded image elsewhere on the page would be falsely suppressed.
+ * - By requiring both vertical/horizontal bounding-box proximity AND textual containment at that
+ *   location, OCR re-reads of selectable PDF text are suppressed while embedded-image text at
+ *   a different page location is preserved in full.
+ */
+function isOcrElementDuplicatingPdfText(ocrEl, pdfTextElements) {
+  const ocrNorm = normalizeComparableText(ocrEl.text);
+  if (!ocrNorm) return true;
+
+  const ocrLeft = ocrEl.x;
+  const ocrRight = ocrEl.x + ocrEl.width;
+  const ocrCenterY = ocrEl.y + ocrEl.height / 2;
+
+  for (const pdfEl of pdfTextElements) {
+    const pdfCenterY = pdfEl.y + pdfEl.height / 2;
+    const verticalTolerance = Math.max(ocrEl.height, pdfEl.height, 14) * 0.85;
+    if (Math.abs(ocrCenterY - pdfCenterY) > verticalTolerance) {
+      continue;
+    }
+
+    const pdfLeft = pdfEl.x - 8;
+    const pdfRight = pdfEl.x + pdfEl.width + 8;
+    const horizOverlap = Math.min(ocrRight, pdfRight) - Math.max(ocrLeft, pdfLeft);
+    if (horizOverlap <= 0) {
+      continue;
+    }
+
+    const pdfNorm = normalizeComparableText(pdfEl.text);
+    if (!pdfNorm) continue;
+
+    if (pdfNorm.includes(ocrNorm) || ocrNorm.includes(pdfNorm)) {
+      return true;
+    }
+
+    // For multi-word OCR lines overlapping a pdf-text line at the same coordinates,
+    // check whether the majority of OCR words are already present in that overlapping pdf-text element.
+    const ocrTokens = ocrNorm.split(/\s+/).filter((t) => t.length >= 2);
+    if (ocrTokens.length >= 2) {
+      const matchedCount = ocrTokens.filter((tok) => pdfNorm.includes(tok)).length;
+      if (matchedCount >= Math.ceil(ocrTokens.length * 0.7)) {
+        return true;
+      }
+    }
+  }
+
+  return false;
+}
+
 /**
  * Extract word-level and line-level OCR elements from Tesseract.js v7 blocks hierarchy,
  * converting pixel bounding boxes into 1.0x PDF point coordinates.
@@ -64,8 +160,10 @@ function extractOcrElementsFromData(ocrData, ocrScale) {
   const ocrElements = [];
   const blocks = ocrData?.blocks || [];
   if (blocks.length > 0 && !Array.isArray(blocks[0]?.paragraphs)) {
-    console.warn('[DocShield] blocks structure incompatible with expected v6+ format');
-    return ocrElements;
+    const err = new Error('OCR engine returned an incompatible blocks structure (missing paragraphs array).');
+    err.code = 'OCR_BLOCKS_INCOMPATIBLE';
+    err.statusCode = 500;
+    throw err;
   }
 
   for (const block of blocks) {
@@ -120,7 +218,8 @@ function extractOcrElementsFromData(ocrData, ocrScale) {
 
 /**
  * Extract embedded text and bounding-box items from a PDF file.
- * Automatically falls back to Tesseract.js OCR for any page that has little/no embedded text.
+ * Automatically falls back to Tesseract.js OCR for any page that has little/no embedded text,
+ * AND runs hybrid OCR inspection on pages that contain both selectable text and embedded raster images.
  *
  * @param {string} filePath - Path to the PDF file on disk
  * @param {object} options - { forceOcr: boolean }
@@ -178,6 +277,9 @@ export async function extractPdfContent(filePath, options = {}) {
       const textContent = await page.getTextContent();
       const rawItems = textContent.items || [];
 
+      // Inspect PDF page operator list for embedded raster images
+      const { hasEmbeddedImages, imageOperatorCount } = await detectEmbeddedImagesOnPage(page);
+
       // Convert PDF.js text items into normalized top-left coordinate items (PDF points)
       const textElements = [];
       const textLines = [];
@@ -210,37 +312,74 @@ export async function extractPdfContent(filePath, options = {}) {
       }
 
       const joinedPdfText = textLines.join(' ').replace(/\s+/g, ' ').trim();
+      const hasSubstantialText = joinedPdfText.length >= 15;
       let pageMethod = 'pdf-text';
       let finalPageText = joinedPdfText;
       let finalElements = textElements;
 
-      // Trigger OCR fallback if page has fewer than 15 characters of embedded text OR forceOcr is enabled
-      if (forceOcr || joinedPdfText.length < 15) {
+      // Trigger OCR when:
+      // 1. `forceOcr` is requested (e.g., during post-redaction verification), OR
+      // 2. The page has fewer than 15 characters of selectable text (`ocr-fallback`), OR
+      // 3. The page has selectable text AND embedded raster images (`hybrid`).
+      if (forceOcr || !hasSubstantialText || hasEmbeddedImages) {
         usedOcrFallback = true;
-        pageMethod = joinedPdfText.length < 15 ? 'ocr-fallback' : 'hybrid';
+        pageMethod = !hasSubstantialText ? 'ocr-fallback' : 'hybrid';
 
+        let ocrData;
         const ocrScale = 2.0;
-        const { canvas } = await renderPageToCanvas(page, ocrScale);
-        const imageBuffer = canvas.toBuffer('image/png');
+        try {
+          const { canvas } = await renderPageToCanvas(page, ocrScale);
+          const imageBuffer = canvas.toBuffer('image/png');
 
-        if (!ocrWorker) {
-          ocrWorker = await createWorker('eng');
+          if (!ocrWorker) {
+            ocrWorker = await createWorker('eng');
+          }
+
+          // Request text: true, blocks: true so Tesseract.js v7 populates blocks -> paragraphs -> lines -> words with bboxes
+          const ocrResult = await ocrWorker.recognize(imageBuffer, {}, { text: true, blocks: true });
+          if (!ocrResult || !ocrResult.data) {
+            throw new Error('OCR worker returned empty recognition data.');
+          }
+          ocrData = ocrResult.data;
+        } catch (ocrErr) {
+          const err = new Error(
+            `OCR inspection failed on page ${pageNum}: ${ocrErr.message || 'Unknown OCR error'}`
+          );
+          err.code = ocrErr.code || 'OCR_EXTRACTION_FAILED';
+          err.statusCode = ocrErr.statusCode || 500;
+          throw err;
         }
 
-        // Request blocks: true so Tesseract.js v7 populates blocks -> paragraphs -> lines -> words with bboxes
-        const ocrResult = await ocrWorker.recognize(imageBuffer, {}, { text: true, blocks: true });
-        const ocrData = ocrResult?.data || {};
         const ocrText = (ocrData.text || '').trim();
-
         const ocrElements = extractOcrElementsFromData(ocrData, ocrScale);
 
-        if (joinedPdfText.length < 15) {
+        if (!hasSubstantialText) {
           finalPageText = ocrText;
           finalElements = ocrElements;
         } else {
-          finalPageText = `${joinedPdfText}\n${ocrText}`.trim();
-          finalElements = [...textElements, ...ocrElements];
+          // Hybrid page: merge selectable PDF text with non-duplicate OCR elements originating from embedded images
           usedPdfText = true;
+          const uniqueOcrElements = ocrElements.filter(
+            (ocrEl) => !isOcrElementDuplicatingPdfText(ocrEl, textElements)
+          );
+          const uniqueOcrLineTexts = uniqueOcrElements
+            .filter((el) => el.source === 'ocr-line')
+            .map((el) => el.text.trim())
+            .filter(Boolean);
+
+          // If line-level elements were filtered out but unique word-level elements remain, preserve their text
+          const supplementalOcrText =
+            uniqueOcrLineTexts.length > 0
+              ? uniqueOcrLineTexts.join('\n')
+              : uniqueOcrElements
+                  .filter((el) => el.source === 'ocr')
+                  .map((el) => el.text.trim())
+                  .join(' ');
+
+          finalPageText = supplementalOcrText
+            ? `${joinedPdfText}\n${supplementalOcrText}`.trim()
+            : joinedPdfText;
+          finalElements = [...textElements, ...uniqueOcrElements];
         }
       } else {
         usedPdfText = true;
@@ -251,6 +390,8 @@ export async function extractPdfContent(filePath, options = {}) {
         width: Number(pageWidth.toFixed(2)),
         height: Number(pageHeight.toFixed(2)),
         method: pageMethod,
+        hasEmbeddedImages,
+        imageOperatorCount,
         text: finalPageText,
         elements: finalElements,
       });
