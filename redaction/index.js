@@ -7,6 +7,18 @@ import { renderPageToCanvas } from '../extraction/index.js';
 import { config } from '../config/index.js';
 import { ensureTempDirs, computeSha256 } from '../config/storage.js';
 
+function isValidBox(box) {
+  return (
+    Boolean(box) &&
+    typeof box.x === 'number' &&
+    typeof box.y === 'number' &&
+    typeof box.width === 'number' &&
+    typeof box.height === 'number' &&
+    box.width > 0 &&
+    box.height > 0
+  );
+}
+
 /**
  * Permanently redacts a PDF document.
  *
@@ -54,20 +66,35 @@ export async function generatePermanentlyRedactedPdf(originalPdfPath, itemsToRed
     // Filter items belonging to this page
     const pageItems = itemsToRedact.filter((item) => item.pageNumber === pageNum);
 
-    // Also inspect raw PDF text items on this page to ensure any text run containing
-    // a selected sensitive string is completely covered even if a regex matched a substring
+    // Also inspect raw PDF text items on this page to ensure any embedded text run containing
+    // a selected sensitive string is completely covered on digital PDFs
     const textContent = await page.getTextContent();
     const rawTextItems = textContent.items || [];
+    const consumedRawIndices = new Set();
 
     context.save();
     context.fillStyle = '#000000';
 
     for (const item of pageItems) {
       let drewBox = false;
+      const padX = 4;
+      const padY = 3;
 
-      if (item.boundingBox) {
-        const padX = 4;
-        const padY = 3;
+      // 1. If the item has multi-line `boundingBoxes` (e.g., a wrapped 2-line address),
+      //    draw tight individual masks over each line segment rather than a single giant rectangle.
+      if (Array.isArray(item.boundingBoxes) && item.boundingBoxes.length > 0) {
+        for (const segBox of item.boundingBoxes) {
+          if (isValidBox(segBox)) {
+            const rx = Math.max(0, (segBox.x - padX) * renderScale);
+            const ry = Math.max(0, (segBox.y - padY) * renderScale);
+            const rw = (segBox.width + padX * 2) * renderScale;
+            const rh = (segBox.height + padY * 2) * renderScale;
+            context.fillRect(rx, ry, rw, rh);
+            drewBox = true;
+          }
+        }
+      } else if (isValidBox(item.boundingBox)) {
+        // Single-line bounding box (handles both OCR and PDF-text items)
         const rx = Math.max(0, (item.boundingBox.x - padX) * renderScale);
         const ry = Math.max(0, (item.boundingBox.y - padY) * renderScale);
         const rw = (item.boundingBox.width + padX * 2) * renderScale;
@@ -77,12 +104,17 @@ export async function generatePermanentlyRedactedPdf(originalPdfPath, itemsToRed
         drewBox = true;
       }
 
-      // Also check raw PDF text items for any substring match of item.text
-      const targetNorm = (item.text || '').trim().toLowerCase();
-      if (targetNorm) {
-        for (const raw of rawTextItems) {
-          const rawStr = (raw.str || '').trim();
+      // 2. Also check raw PDF text items for any single-line substring match on digital PDFs.
+      //    If the item has a specific boundingBox, only match the rawTextItem on the same vertical band
+      //    so selective redaction of one duplicate does not accidentally mask an unselected duplicate elsewhere.
+      const targetNorm = (item.text || '').replace(/\s+/g, ' ').trim().toLowerCase();
+      if (targetNorm && (!Array.isArray(item.boundingBoxes) || item.boundingBoxes.length <= 1)) {
+        for (let rawIdx = 0; rawIdx < rawTextItems.length; rawIdx++) {
+          if (consumedRawIndices.has(rawIdx)) continue;
+          const raw = rawTextItems[rawIdx];
+          const rawStr = (raw.str || '').replace(/\s+/g, ' ').trim();
           if (!rawStr) continue;
+
           if (rawStr.toLowerCase().includes(targetNorm)) {
             const tx = raw.transform ? raw.transform[4] : 0;
             const ty = raw.transform ? raw.transform[5] : 0;
@@ -90,23 +122,35 @@ export async function generatePermanentlyRedactedPdf(originalPdfPath, itemsToRed
             const rawW = Math.max(raw.width || rawStr.length * (fontH * 0.6), 20);
             const topY = Math.max(0, baseViewport.height - ty - fontH * 0.9);
 
-            // Calculate proportional offset if the sensitive value is preceded by a label (e.g. "Phone: +91-9876543210")
+            if (isValidBox(item.boundingBox) && Math.abs(topY - item.boundingBox.y) > 18) {
+              continue;
+            }
+
             const matchIdx = rawStr.toLowerCase().indexOf(targetNorm);
             const startRatio = Math.max(0, (matchIdx - 1) / Math.max(rawStr.length, 1));
+            const widthRatio = Math.min(1 - startRatio, (targetNorm.length + 2) / Math.max(rawStr.length, 1));
             const maskX = (tx + rawW * startRatio - 3) * renderScale;
             const maskY = (topY - 3) * renderScale;
-            const maskW = (rawW * (1 - startRatio) + 10) * renderScale;
+            const maskW = (rawW * widthRatio + 10) * renderScale;
             const maskH = (fontH * 1.35 + 4) * renderScale;
 
             context.fillRect(maskX, maskY, maskW, maskH);
+            consumedRawIndices.add(rawIdx);
             drewBox = true;
+            break;
           }
         }
       }
 
-      // Fallback safety mask if neither boundingBox nor rawTextItems matched
+      // Never substitute a hardcoded fallback rectangle or silently report success if location could not be established
       if (!drewBox) {
-        context.fillRect(40 * renderScale, 100 * renderScale, 300 * renderScale, 20 * renderScale);
+        context.restore();
+        const err = new Error(
+          `Redaction failed for item "${item.id}" on page ${pageNum}: bounding box coordinates could not be established.`
+        );
+        err.code = 'REDACTION_COORDINATES_MISSING';
+        err.statusCode = 422;
+        throw err;
       }
     }
 

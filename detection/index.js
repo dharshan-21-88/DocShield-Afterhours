@@ -9,8 +9,8 @@
  * 5. Aadhaar-like or National ID-like patterns (NATIONAL_ID_AADHAAR)
  * 6. Financial account / IFSC / card-like numbers (FINANCIAL_ACCOUNT)
  *
- * Returns bounding boxes (when matched to page elements), page numbers,
- * categories, and explicit confidence / uncertainty indicators.
+ * Returns bounding boxes (and per-line boundingBoxes for multi-line wrapped values),
+ * page numbers, categories, and explicit confidence / uncertainty indicators.
  */
 
 export const SENSITIVE_CATEGORIES = {
@@ -72,70 +72,287 @@ const DETECTION_PATTERNS = [
   },
 ];
 
+function cleanToken(str) {
+  return (str || '').replace(/^[,.;:()[\]"']+|[,.;:()[\]"']+$/g, '').trim().toLowerCase();
+}
+
 /**
- * Locate the best bounding box on the page for a detected text snippet.
- * Searches through extracted PDF text elements and OCR word/line elements.
+ * Check if a candidate word token matches a target token under constrained fallback rules:
+ * Only matches if the candidate word starts with a label prefix separated by `:`, `=`, or `/`
+ * (e.g., `email:user@example.com` or `no:reg-2026-cs-0492`), never an arbitrary alphanumeric superstring
+ * like `ref482900` for `4829`.
  */
-function findBoundingBoxForMatch(matchText, page, usedBoxes) {
+function isConstrainedPrefixMatch(wordNorm, targetNorm) {
+  if (!wordNorm || !targetNorm || wordNorm === targetNorm) return false;
+  if (!wordNorm.endsWith(targetNorm)) return false;
+  const prefix = wordNorm.slice(0, wordNorm.length - targetNorm.length);
+  return /[:=/#-]$/.test(prefix);
+}
+
+/**
+ * Group a list of page elements into distinct horizontal line bands (within 12pt Y tolerance)
+ * and compute a tight bounding box per line band, plus an overall summary boundingBox.
+ */
+function buildLineBoxesFromElements(elements, pageWidth) {
+  if (!elements || elements.length === 0) return null;
+
+  const bands = [];
+  for (const el of elements) {
+    let band = bands.find((b) => Math.abs(b.anchorY - el.y) <= 12);
+    if (!band) {
+      band = { anchorY: el.y, items: [] };
+      bands.push(band);
+    }
+    band.items.push(el);
+  }
+
+  const boundingBoxes = bands.map((band) => {
+    const minX = Math.min(...band.items.map((w) => w.x));
+    const minY = Math.min(...band.items.map((w) => w.y));
+    const maxX = Math.max(...band.items.map((w) => w.x + w.width));
+    const maxY = Math.max(...band.items.map((w) => w.y + w.height));
+
+    const boxX = Math.max(0, minX - 3);
+    const boxY = Math.max(0, minY - 2);
+    const boxW = Math.min(pageWidth - boxX, maxX - minX + 6);
+    const boxH = maxY - minY + 4;
+
+    return {
+      x: Number(boxX.toFixed(2)),
+      y: Number(boxY.toFixed(2)),
+      width: Number(boxW.toFixed(2)),
+      height: Number(boxH.toFixed(2)),
+      coordinateSpace: 'pdf-top-left-points',
+    };
+  });
+
+  const overallMinX = Math.min(...boundingBoxes.map((b) => b.x));
+  const overallMinY = Math.min(...boundingBoxes.map((b) => b.y));
+  const overallMaxX = Math.max(...boundingBoxes.map((b) => b.x + b.width));
+  const overallMaxY = Math.max(...boundingBoxes.map((b) => b.y + b.height));
+
+  const primaryBox = {
+    x: Number(overallMinX.toFixed(2)),
+    y: Number(overallMinY.toFixed(2)),
+    width: Number((overallMaxX - overallMinX).toFixed(2)),
+    height: Number((overallMaxY - overallMinY).toFixed(2)),
+    coordinateSpace: 'pdf-top-left-points',
+  };
+
+  return {
+    boundingBox: primaryBox,
+    boundingBoxes,
+  };
+}
+
+/**
+ * Compute proportional horizontal sub-box within a single line element (`pdf-text` or `ocr-line`)
+ * for a substring [startCharIdx, startCharIdx + subLength].
+ */
+function buildSubBoxInLineElement(el, startCharIdx, subLength, pageWidth) {
+  const elText = (el.text || '').replace(/\s+/g, ' ').trim();
+  const totalLen = Math.max(elText.length, 1);
+  const ratioStart = Math.max(0, startCharIdx / totalLen);
+  const ratioWidth = Math.min(1 - ratioStart, subLength / totalLen);
+
+  const subX = Math.max(0, el.x + el.width * ratioStart - 4);
+  const subWidth = Math.min(pageWidth - subX, Math.max(el.width * ratioWidth + 12, 36));
+
+  return {
+    x: Number(subX.toFixed(2)),
+    y: Number(Math.max(0, el.y - 2).toFixed(2)),
+    width: Number(subWidth.toFixed(2)),
+    height: Number((el.height + 4).toFixed(2)),
+    coordinateSpace: 'pdf-top-left-points',
+  };
+}
+
+/**
+ * Locate the accurate bounding box(es) on the page for a detected text snippet.
+ *
+ * Addresses Code Review Findings:
+ * - L-1: Strategy 1 runs a strict exact token pass (`wNorm === tNorm`) first before considering
+ *        a constrained label-prefix fallback pass (`isConstrainedPrefixMatch`), preventing false
+ *        substring collisions (e.g., `"4829"` inside `"REF482900"`).
+ * - M-1: Tracks consumed word/line element positions in `usedBoxKeys` so duplicate occurrences of
+ *        the same email, phone number, or ID on the same page each receive their own distinct bounding box.
+ * - H-1: Supports multi-line / wrapped sensitive values (both across contiguous OCR words on consecutive
+ *        lines and across consecutive `pdf-text` / `ocr-line` elements), returning per-line `boundingBoxes`
+ *        so every wrapped line is masked tightly without drawing a giant box over unrelated text.
+ * - H-2: Never anchors blindly to `matchedEls[0]` using a single shared word (like a city name in a header);
+ *        requires contiguous token sequence matching or multi-line prefix+suffix line continuity.
+ */
+export function findBoundingBoxForMatch(matchText, page, usedBoxKeys) {
   const normalizedTarget = matchText.replace(/\s+/g, ' ').trim().toLowerCase();
   if (!normalizedTarget) return null;
 
   const elements = page.elements || [];
+  if (elements.length === 0) return null;
 
-  // 1. Direct containment in an element (e.g. a PDF text line or OCR line containing the match)
-  for (const el of elements) {
-    const elText = (el.text || '').replace(/\s+/g, ' ').trim();
-    const elLower = elText.toLowerCase();
-    if (!elLower) continue;
+  const ocrWords = elements.filter((el) => el.source === 'ocr');
+  const targetWords = normalizedTarget.split(/\s+/).map(cleanToken).filter(Boolean);
 
-    const idx = elLower.indexOf(normalizedTarget);
-    if (idx !== -1) {
-      // Estimate horizontal sub-box within the text line if the element is much wider than the match
-      const ratioStart = Math.max(0, idx / Math.max(elLower.length, 1));
-      const ratioWidth = Math.min(1 - ratioStart, normalizedTarget.length / Math.max(elLower.length, 1));
+  // =========================================================================
+  // STRATEGY 1: Word-level contiguous sequence match (`source === 'ocr'`)
+  // Pass 1A: Strict exact token equality (`wNorm === tNorm`)
+  // Pass 1B: Constrained label-prefix equality (`wNorm === tNorm || isConstrainedPrefixMatch`)
+  // =========================================================================
+  if (ocrWords.length > 0 && targetWords.length > 0) {
+    for (const allowPrefixFallback of [false, true]) {
+      for (let i = 0; i <= ocrWords.length - targetWords.length; i++) {
+        let allMatch = true;
+        for (let j = 0; j < targetWords.length; j++) {
+          const wNorm = cleanToken(ocrWords[i + j].text);
+          const tNorm = targetWords[j];
+          const isExact = wNorm === tNorm;
+          const isConstrained = allowPrefixFallback && isConstrainedPrefixMatch(wNorm, tNorm);
+          if (!isExact && !isConstrained) {
+            allMatch = false;
+            break;
+          }
+        }
 
-      // Add generous padding on width/height so redaction covers the full sensitive string cleanly
-      const subX = Math.max(0, el.x + el.width * ratioStart - 4);
-      const subWidth = Math.min(page.width - subX, Math.max(el.width * ratioWidth + 12, 40));
-      const boxKey = `${Math.round(subX)}_${Math.round(el.y)}`;
-
-      if (!usedBoxes.has(boxKey)) {
-        usedBoxes.add(boxKey);
-        return {
-          x: Number(subX.toFixed(2)),
-          y: Number(Math.max(0, el.y - 2).toFixed(2)),
-          width: Number(subWidth.toFixed(2)),
-          height: Number((el.height + 4).toFixed(2)),
-          coordinateSpace: 'pdf-top-left-points',
-        };
+        if (allMatch) {
+          const seqKey = `ocr_word_seq_${i}_${targetWords.length}`;
+          if (!usedBoxKeys.has(seqKey)) {
+            usedBoxKeys.add(seqKey);
+            const seq = ocrWords.slice(i, i + targetWords.length);
+            return buildLineBoxesFromElements(seq, page.width);
+          }
+        }
       }
     }
   }
 
-  // 2. Multi-token union match (e.g. when OCR splits "4829 7301 9482" into 3 word boxes)
-  const targetTokens = normalizedTarget.split(/[\s,.-]+/).filter((t) => t.length >= 2);
-  if (targetTokens.length > 0) {
-    const matchedEls = elements.filter((el) => {
-      const w = (el.text || '').toLowerCase();
-      return targetTokens.some((tok) => w.includes(tok));
-    });
+  // =========================================================================
+  // STRATEGY 2: Single-line and Multi-line Wrapped Containment in Line Elements
+  // (`source === 'pdf-text'` or `source === 'ocr-line'`)
+  // =========================================================================
+  const lineElements = elements.filter((el) => el.source !== 'ocr');
+  const candidateLines = lineElements.length > 0 ? lineElements : elements;
 
-    if (matchedEls.length > 0) {
-      // Group elements that are on roughly the same vertical band
-      const anchor = matchedEls[0];
-      const cluster = matchedEls.filter((el) => Math.abs(el.y - anchor.y) < 35);
-      const minX = Math.min(...cluster.map((c) => c.x));
-      const minY = Math.min(...cluster.map((c) => c.y));
-      const maxX = Math.max(...cluster.map((c) => c.x + c.width));
-      const maxY = Math.max(...cluster.map((c) => c.y + c.height));
+  // Pass 2A: Single-line direct substring containment (supports multiple occurrences on same/different lines)
+  for (let elIdx = 0; elIdx < candidateLines.length; elIdx++) {
+    const el = candidateLines[elIdx];
+    const elText = (el.text || '').replace(/\s+/g, ' ').trim();
+    const elLower = elText.toLowerCase();
+    if (!elLower) continue;
 
-      return {
-        x: Number(Math.max(0, minX - 4).toFixed(2)),
-        y: Number(Math.max(0, minY - 2).toFixed(2)),
-        width: Number(Math.min(page.width - minX, maxX - minX + 10).toFixed(2)),
-        height: Number((maxY - minY + 4).toFixed(2)),
-        coordinateSpace: 'pdf-top-left-points',
-      };
+    let searchStart = 0;
+    while (searchStart < elLower.length) {
+      const idx = elLower.indexOf(normalizedTarget, searchStart);
+      if (idx === -1) break;
+
+      const boxKey = `line_single_${elIdx}_${idx}`;
+      if (!usedBoxKeys.has(boxKey)) {
+        usedBoxKeys.add(boxKey);
+        const subBox = buildSubBoxInLineElement(el, idx, normalizedTarget.length, page.width);
+        return {
+          boundingBox: subBox,
+          boundingBoxes: [subBox],
+        };
+      }
+      searchStart = idx + Math.max(normalizedTarget.length, 1);
+    }
+  }
+
+  // Pass 2B: Multi-line wrapped value across 2 or 3 consecutive line elements (Fixes H-1 & H-2)
+  if (candidateLines.length >= 2) {
+    for (const spanCount of [2, 3]) {
+      for (let startIdx = 0; startIdx <= candidateLines.length - spanCount; startIdx++) {
+        const spanEls = candidateLines.slice(startIdx, startIdx + spanCount);
+        const normTexts = spanEls.map((e) => (e.text || '').replace(/\s+/g, ' ').trim().toLowerCase());
+        if (normTexts.some((t) => !t)) continue;
+
+        // Build combined text with single-space join and track each line's [charStart, charEnd]
+        const ranges = [];
+        let combined = '';
+        for (let k = 0; k < normTexts.length; k++) {
+          if (k > 0) combined += ' ';
+          const s = combined.length;
+          combined += normTexts[k];
+          ranges.push({ lineIndex: k, start: s, end: combined.length, text: normTexts[k] });
+        }
+
+        const matchPos = combined.indexOf(normalizedTarget);
+        if (matchPos !== -1) {
+          const matchEnd = matchPos + normalizedTarget.length;
+          // Ensure the match actually spans across the boundary of the selected lines
+          const touchesFirst = matchPos < ranges[0].end;
+          const touchesLast = matchEnd > ranges[ranges.length - 1].start;
+          if (!touchesFirst || !touchesLast) continue;
+
+          const spanKey = `line_wrapped_${startIdx}_${spanCount}_${matchPos}`;
+          if (usedBoxKeys.has(spanKey)) continue;
+          usedBoxKeys.add(spanKey);
+
+          const boundingBoxes = [];
+          for (const r of ranges) {
+            const overlapStart = Math.max(matchPos, r.start);
+            const overlapEnd = Math.min(matchEnd, r.end);
+            if (overlapEnd > overlapStart) {
+              const localStart = overlapStart - r.start;
+              const localLen = overlapEnd - overlapStart;
+              const el = spanEls[r.lineIndex];
+              boundingBoxes.push(buildSubBoxInLineElement(el, localStart, localLen, page.width));
+            }
+          }
+
+          if (boundingBoxes.length > 0) {
+            const minX = Math.min(...boundingBoxes.map((b) => b.x));
+            const minY = Math.min(...boundingBoxes.map((b) => b.y));
+            const maxX = Math.max(...boundingBoxes.map((b) => b.x + b.width));
+            const maxY = Math.max(...boundingBoxes.map((b) => b.y + b.height));
+
+            return {
+              boundingBox: {
+                x: Number(minX.toFixed(2)),
+                y: Number(minY.toFixed(2)),
+                width: Number((maxX - minX).toFixed(2)),
+                height: Number((maxY - minY).toFixed(2)),
+                coordinateSpace: 'pdf-top-left-points',
+              },
+              boundingBoxes,
+            };
+          }
+        }
+      }
+    }
+  }
+
+  // =========================================================================
+  // STRATEGY 3: Ordered Contiguous Sub-Token Window Match (Fixes H-1 & H-2)
+  // Requires at least 60% of split tokens (and at least the starting token) to
+  // appear in order within a contiguous window of page words, preventing a single
+  // common word (like a city name in the header) from anchoring the bounding box.
+  // =========================================================================
+  const splitTokens = normalizedTarget.split(/[\s,.-]+/).map(cleanToken).filter((t) => t.length >= 2);
+  if (splitTokens.length >= 2 && ocrWords.length > 0) {
+    const firstTok = splitTokens[0];
+    const lastTok = splitTokens[splitTokens.length - 1];
+    const maxWindowLen = splitTokens.length + 4;
+
+    for (let i = 0; i < ocrWords.length; i++) {
+      const wStart = cleanToken(ocrWords[i].text);
+      if (wStart !== firstTok && !isConstrainedPrefixMatch(wStart, firstTok)) continue;
+
+      for (let end = i + 1; end < Math.min(ocrWords.length, i + maxWindowLen); end++) {
+        const wEnd = cleanToken(ocrWords[end].text);
+        if (wEnd !== lastTok) continue;
+
+        const windowWords = ocrWords.slice(i, end + 1);
+        const matchedTokenCount = splitTokens.filter((tok) =>
+          windowWords.some((w) => cleanToken(w.text) === tok || isConstrainedPrefixMatch(cleanToken(w.text), tok))
+        ).length;
+
+        if (matchedTokenCount >= Math.ceil(splitTokens.length * 0.6)) {
+          const winKey = `ocr_window_${i}_${end}`;
+          if (!usedBoxKeys.has(winKey)) {
+            usedBoxKeys.add(winKey);
+            return buildLineBoxesFromElements(windowWords, page.width);
+          }
+        }
+      }
     }
   }
 
@@ -160,8 +377,10 @@ export function detectSensitiveInfo(extractionResult, allowedCategories = null) 
 
   for (const page of extractionResult.pages || []) {
     const pageText = page.text || '';
-    const usedBoxes = new Set();
-    const seenOnPage = new Set();
+    const usedBoxKeys = new Set();
+    // Track character spans [start, end] on pageText to prevent cross-category overlap at the SAME text offset,
+    // while allowing duplicate occurrences of the same value at DIFFERENT offsets on the page (Fixes M-1).
+    const matchedIntervals = [];
 
     for (const pattern of DETECTION_PATTERNS) {
       if (!categorySet.has(pattern.category)) continue;
@@ -169,31 +388,35 @@ export function detectSensitiveInfo(extractionResult, allowedCategories = null) 
       const regex = new RegExp(pattern.regex.source, pattern.regex.flags);
       let match;
       while ((match = regex.exec(pageText)) !== null) {
-        const matchedText = match[0].trim();
+        const rawMatch = match[0];
+        const matchedText = rawMatch.trim();
         if (!matchedText) continue;
 
-        // Prevent duplicate overlap (e.g., an Aadhaar 12-digit number also matching a 10-digit phone regex)
-        const dedupeKey = `${pattern.category}::${matchedText}`;
-        if (seenOnPage.has(dedupeKey)) continue;
+        const matchStart = match.index + rawMatch.indexOf(matchedText);
+        const matchEnd = matchStart + matchedText.length;
 
-        // Avoid classifying part of an Aadhaar or Financial Account number as a Phone Number
-        if (pattern.category === 'PHONE_NUMBER') {
-          const alreadyMatchedAsIdOrAcc = detectedItems.some(
-            (item) =>
-              item.pageNumber === page.pageNumber &&
-              (item.category === 'NATIONAL_ID_AADHAAR' || item.category === 'FINANCIAL_ACCOUNT') &&
-              item.text.includes(matchedText)
-          );
-          if (alreadyMatchedAsIdOrAcc) continue;
-        }
+        // Skip if this exact character span [matchStart, matchEnd] was already matched
+        // by an equal or higher-priority pattern (e.g., a 10-digit substring inside an Aadhaar or Account number)
+        const overlapsExistingSpan = matchedIntervals.some(
+          (span) => matchStart >= span.start && matchEnd <= span.end
+        );
+        if (overlapsExistingSpan) continue;
 
-        seenOnPage.add(dedupeKey);
+        matchedIntervals.push({
+          start: matchStart,
+          end: matchEnd,
+          category: pattern.category,
+          text: matchedText,
+        });
 
-        const boundingBox = findBoundingBoxForMatch(matchedText, page, usedBoxes);
+        const boxResult = findBoundingBoxForMatch(matchedText, page, usedBoxKeys);
+        const boundingBox = boxResult ? boxResult.boundingBox : null;
+        const boundingBoxes = boxResult ? boxResult.boundingBoxes : null;
+
         const confidence = boundingBox ? pattern.confidence : 'LOW_UNCERTAIN';
         const detectionStatus = boundingBox
           ? pattern.statusNote
-          : `${pattern.statusNote} (exact bounding box uncertain; fallback line region applied)`;
+          : `${pattern.statusNote} (coordinates could not be established on page)`;
 
         const item = {
           id: `det_${counter++}`,
@@ -204,6 +427,7 @@ export function detectSensitiveInfo(extractionResult, allowedCategories = null) 
           detectionStatus,
           pageNumber: page.pageNumber,
           boundingBox,
+          ...(boundingBoxes && boundingBoxes.length > 1 ? { boundingBoxes } : {}),
         };
 
         detectedItems.push(item);
