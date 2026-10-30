@@ -389,6 +389,15 @@ async function runTests() {
         const downloadRes = await fetch(`${baseUrl}/api/download/${marksDocId}`);
         assert.strictEqual(downloadRes.status, 200);
         assert.strictEqual(downloadRes.headers.get('x-document-sha256'), autoRedact.redactedPdfSha256);
+
+        // Verify original PDF retrieval endpoint
+        const originalRes = await fetch(`${baseUrl}/api/original/${marksDocId}`);
+        assert.strictEqual(originalRes.status, 200);
+        assert.strictEqual(originalRes.headers.get('content-type'), 'application/pdf');
+        const marksRecord = getDocumentRecord(marksDocId);
+        assert.strictEqual(originalRes.headers.get('x-document-sha256'), marksRecord.originalSha256);
+        const originalBuf = Buffer.from(await originalRes.arrayBuffer());
+        assert.strictEqual(originalBuf.subarray(0, 5).toString('ascii'), '%PDF-');
       },
     },
 
@@ -709,6 +718,11 @@ async function runTests() {
         const dlBody = await dlRes.json();
         assert.strictEqual(dlRes.status, 404);
         assert.strictEqual(dlBody.error, 'REDACTED_FILE_NOT_FOUND');
+
+        const origRes = await fetch(`${baseUrl}/api/original/doc_does_not_exist_999999`);
+        const origBody = await origRes.json();
+        assert.strictEqual(origRes.status, 404);
+        assert.strictEqual(origBody.error, 'ORIGINAL_FILE_NOT_FOUND');
       },
     },
     {

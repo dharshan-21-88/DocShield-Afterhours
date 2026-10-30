@@ -10,6 +10,7 @@ import {
   verifyPdfController,
   getReportController,
   downloadRedactedPdfController,
+  getOriginalPdfController,
 } from '../controllers/index.js';
 
 const router = Router();
@@ -38,5 +39,8 @@ router.get('/report/:id', getReportController);
 
 // 8. Download protected PDF
 router.get('/download/:documentId', downloadRedactedPdfController);
+
+// 9. Retrieve original PDF (for client-side preview of server-generated samples)
+router.get('/original/:documentId', getOriginalPdfController);
 
 export default router;

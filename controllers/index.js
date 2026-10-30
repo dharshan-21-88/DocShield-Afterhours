@@ -475,3 +475,31 @@ export function downloadRedactedPdfController(req, res) {
   const stream = fs.createReadStream(docRecord.redactedFilePath);
   stream.pipe(res);
 }
+
+/**
+ * GET /api/original/:documentId
+ */
+export function getOriginalPdfController(req, res) {
+  const { documentId } = req.params;
+  const docRecord = getDocumentRecord(documentId);
+
+  if (!docRecord || !docRecord.originalFilePath || !fs.existsSync(docRecord.originalFilePath)) {
+    return res.status(404).json({
+      success: false,
+      error: 'ORIGINAL_FILE_NOT_FOUND',
+      message: `Original PDF for document "${documentId}" was not found or has expired.`,
+    });
+  }
+
+  const safeBaseName = (docRecord.fileName || 'document.pdf').replace(/[^a-zA-Z0-9._-]/g, '_');
+
+  res.setHeader('Content-Type', 'application/pdf');
+  res.setHeader('Content-Disposition', `inline; filename="${safeBaseName}"`);
+  if (docRecord.originalSha256) {
+    res.setHeader('X-Document-SHA256', docRecord.originalSha256);
+  }
+
+  const stream = fs.createReadStream(docRecord.originalFilePath);
+  stream.pipe(res);
+}
+
