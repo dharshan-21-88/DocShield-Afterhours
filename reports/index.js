@@ -105,6 +105,45 @@ export function buildPrivacyAssessmentReport({
     summaryText += ` Note: ${maskObfuscation.obfuscationWarnings.length} redaction mask(s) could not be expanded to full standardized bucket dimensions due to adjacent content or unselected items.`;
   }
 
+  const contextualPrivacy = documentRecord.contextualPrivacy || null;
+  let contextualPrivacyAssessment = null;
+  if (contextualPrivacy) {
+    contextualPrivacyAssessment = {
+      hasContextualRisks: Boolean(contextualPrivacy.hasContextualRisks),
+      overallRiskLevel: contextualPrivacy.overallRiskLevel || 'LOW_INDICATIVE_RISK',
+      labelExposureCount: contextualPrivacy.labelExposureCount || 0,
+      quasiIdentifierCount: contextualPrivacy.quasiIdentifierCount || 0,
+      labelExposures: (contextualPrivacy.labelExposures || []).map((exp) => ({
+        id: exp.id,
+        pageNumber: exp.pageNumber,
+        associatedItemId: exp.associatedItemId,
+        targetCategory: exp.targetCategory,
+        targetCategoryLabel: exp.targetCategoryLabel,
+        labelText: exp.labelText,
+        severity: exp.severity,
+        riskSummary: exp.riskSummary,
+        remediationAdvice: exp.remediationAdvice,
+      })),
+      quasiIdentifiers: (contextualPrivacy.quasiIdentifiers || []).map((qi) => ({
+        id: qi.id,
+        pageNumber: qi.pageNumber,
+        type: qi.type,
+        categoryLabel: qi.categoryLabel,
+        text: qi.text,
+        specificity: qi.specificity,
+        description: qi.description,
+      })),
+      combinatorialRisk: contextualPrivacy.combinatorialRisk || null,
+      disclaimer:
+        contextualPrivacy.disclaimer ||
+        'Heuristic contextual privacy assessment. Ordinary surrounding labels and quasi-identifiers are not automatically redacted.',
+    };
+
+    if (contextualPrivacyAssessment.labelExposureCount > 0) {
+      summaryText += ` Note: Heuristic analysis identified ${contextualPrivacyAssessment.labelExposureCount} category lead-in label exposure(s) in surrounding text.`;
+    }
+  }
+
   return {
     reportId,
     documentId: documentRecord.documentId,
@@ -131,6 +170,7 @@ export function buildPrivacyAssessmentReport({
     remainingSensitiveItems: remainingItems,
     ...(structuralAudit ? { structuralAudit } : {}),
     ...(maskObfuscation ? { maskObfuscation } : {}),
+    ...(contextualPrivacyAssessment ? { contextualPrivacyAssessment } : {}),
     ocrVerification,
     structuralVerification,
     verificationDetails: {
@@ -141,6 +181,7 @@ export function buildPrivacyAssessmentReport({
       ocrVerification,
       structuralVerification,
       ...(maskObfuscation ? { maskObfuscation } : {}),
+      ...(contextualPrivacyAssessment ? { contextualPrivacyAssessment } : {}),
     },
     exportedDocumentIntegrity: {
       algorithm: 'SHA-256',

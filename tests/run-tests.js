@@ -11,7 +11,18 @@ import {
   STANDARD_MASK_WIDTH_BUCKETS_PT,
   STANDARD_MASK_HEIGHT_BUCKETS_PT,
   MASK_OBFUSCATION_STRATEGY,
+  COMPACT_MASK_WIDTH_BUCKETS_PT,
+  COMPACT_MASK_HEIGHT_BUCKETS_PT,
+  COMPACT_MASK_OBFUSCATION_STRATEGY,
+  MASK_OBFUSCATION_PROFILES,
+  getMaskProfile,
 } from '../redaction/index.js';
+import {
+  analyzeContextualPrivacy,
+  detectCategoryLabelExposures,
+  extractQuasiIdentifiers,
+  evaluateQuasiIdentifierCombinations,
+} from '../detection/contextual.js';
 import { config } from '../config/index.js';
 import {
   getDocumentRecord,
@@ -134,6 +145,9 @@ async function runTests() {
   console.log('================================================================');
   console.log('🛡️  DocShield – Automated End-to-End Backend Test Suite');
   console.log('================================================================\n');
+
+  // Test-only environment configuration: allow test suite to execute 60+ end-to-end tests without tripping IP rate limiter
+  config.rateLimit.maxRequests = 5000;
 
   const app = await createApp();
   const server = app.listen(0);
@@ -3606,6 +3620,432 @@ async function runTests() {
           true,
           `Adjacent non-redacted text "Department: Aerospace Engineering" must remain readable (got OCR: "${pageOcrText}")`
         );
+      },
+    },
+    {
+      name: '[P4 Test A] Direct vs Quasi-Identifier Classification & Label Exposure Detection',
+      fn: async () => {
+        const pdfDoc = await PDFDocument.create();
+        const font = await pdfDoc.embedFont(StandardFonts.Helvetica);
+        const page = pdfDoc.addPage([595.28, 841.89]);
+
+        // Place direct PII preceded by explicit category labels, along with quasi-identifiers
+        page.drawText('Permanent Account Number (PAN): ABCDE1234F', { x: 50, y: 740, size: 12, font });
+        page.drawText('Contact Email: dean.aerospace@fictional-univ.edu', { x: 50, y: 700, size: 12, font });
+        page.drawText('Role: Head of Department of Aerospace Engineering', { x: 50, y: 660, size: 12, font });
+        page.drawText('Affiliation: Fictional Institute of Technology, Bengaluru - 560001', { x: 50, y: 620, size: 12, font });
+
+        const buf = Buffer.from(await pdfDoc.save());
+        const up = await uploadCustomPdfBuffer(buf, 'p4_test_a_contextual.pdf');
+        assert.strictEqual(up.status, 201);
+        const docId = up.body.documentId;
+
+        const detRes = await fetch(`${baseUrl}/api/detect`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ documentId: docId }),
+        });
+        const detBody = await detRes.json();
+        assert.strictEqual(detRes.status, 200);
+
+        // 1. Direct identifiers must be detected with bounding boxes
+        assert.strictEqual(detBody.totalDetected, 2, 'Must detect exactly the 2 direct identifiers (PAN & Email)');
+        const panItem = detBody.items.find((i) => i.category === 'NATIONAL_ID_PAN');
+        const emailItem = detBody.items.find((i) => i.category === 'EMAIL_ADDRESS');
+        assert.ok(panItem && emailItem, 'PAN and Email must both be in detectedItems');
+        assert.ok(panItem.boundingBox && emailItem.boundingBox, 'Direct items must have bounding boxes');
+
+        // 2. Contextual privacy analysis must be present and distinguish direct PII from context
+        assert.ok(detBody.contextualPrivacy, 'Response must include contextualPrivacy analysis');
+        const cp = detBody.contextualPrivacy;
+        assert.strictEqual(cp.hasContextualRisks, true);
+        assert.strictEqual(cp.directIdentifierCount, 2);
+
+        // 3. Category label exposures must be identified
+        assert.ok(cp.labelExposureCount >= 2, 'Must detect at least 2 label exposures (PAN and Email)');
+        const panLabel = cp.labelExposures.find((l) => l.targetCategory === 'NATIONAL_ID_PAN');
+        const emailLabel = cp.labelExposures.find((l) => l.targetCategory === 'EMAIL_ADDRESS');
+        assert.ok(panLabel, 'Must detect PAN label exposure');
+        assert.ok(emailLabel, 'Must detect Email label exposure');
+        assert.ok(panLabel.labelText.toLowerCase().includes('pan'), 'Label text must capture PAN lead-in');
+        assert.ok(panLabel.riskSummary && panLabel.remediationAdvice);
+
+        // 4. Quasi-identifiers must be identified separately from direct items
+        assert.ok(cp.quasiIdentifierCount >= 2, 'Must extract quasi-identifiers (Role, Org, Location)');
+        const roleQi = cp.quasiIdentifiers.find((q) => q.type === 'OCCUPATION_ROLE');
+        const orgQi = cp.quasiIdentifiers.find((q) => q.type === 'ORGANIZATION');
+        const locQi = cp.quasiIdentifiers.find((q) => q.type === 'GEOGRAPHIC_LOCATION');
+        assert.ok(roleQi, 'Must detect OCCUPATION_ROLE quasi-identifier');
+        assert.ok(orgQi, 'Must detect ORGANIZATION quasi-identifier');
+        assert.ok(locQi, 'Must detect GEOGRAPHIC_LOCATION quasi-identifier');
+
+        // 5. Ensure disclaimer is honest and explicitly heuristic
+        assert.ok(cp.disclaimer.includes('heuristic'));
+        assert.ok(cp.disclaimer.includes('not automatically redacted'));
+      },
+    },
+    {
+      name: '[P4 Test B] Combinatorial Quasi-Identifier Heuristic Risk Assessment & Explanations',
+      fn: async () => {
+        // Create a document with ZERO direct PII, but multiple specific quasi-identifiers
+        const pdfDoc = await PDFDocument.create();
+        const font = await pdfDoc.embedFont(StandardFonts.Helvetica);
+        const page = pdfDoc.addPage([595.28, 841.89]);
+
+        page.drawText('FACULTY LEADERSHIP PROFILE (PUBLIC ANNOUNCEMENT)', { x: 50, y: 760, size: 14, font });
+        page.drawText('Designation: Dean of Aerospace Engineering', { x: 50, y: 710, size: 12, font });
+        page.drawText('Institution: Fictional Institute of Technology', { x: 50, y: 670, size: 12, font });
+        page.drawText('Campus Location: Bengaluru - 560001', { x: 50, y: 630, size: 12, font });
+        page.drawText('Demographics: Age 62, Class of 1986', { x: 50, y: 590, size: 12, font });
+
+        const buf = Buffer.from(await pdfDoc.save());
+        const up = await uploadCustomPdfBuffer(buf, 'p4_test_b_qi_combinatorial.pdf');
+        assert.strictEqual(up.status, 201);
+        const docId = up.body.documentId;
+
+        const detRes = await fetch(`${baseUrl}/api/detect`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ documentId: docId }),
+        });
+        const detBody = await detRes.json();
+        assert.strictEqual(detRes.status, 200);
+
+        // Zero direct PII identifiers (no email, phone, PAN, Aadhaar, account)
+        assert.strictEqual(detBody.totalDetected, 0, 'Document has no direct PII');
+        assert.strictEqual(detBody.items.length, 0);
+
+        // Contextual analysis flags the combination of Role + Org + Location + Demographic
+        const cp = detBody.contextualPrivacy;
+        assert.ok(cp);
+        assert.strictEqual(cp.hasContextualRisks, true);
+        assert.ok(cp.quasiIdentifierCount >= 3);
+
+        const comb = cp.combinatorialRisk;
+        assert.strictEqual(comb.hasCombinatorialRisk, true);
+        assert.ok(comb.flaggedCombinations.length > 0);
+
+        const flagged = comb.flaggedCombinations[0];
+        assert.ok(flagged.evidenceSnippet.includes('Role:'));
+        assert.ok(flagged.evidenceSnippet.includes('Organization:'));
+        assert.ok(flagged.reason.includes('narrows the candidate pool'));
+        assert.ok(flagged.remediationAdvice);
+
+        // Must disclaim population uniqueness
+        assert.ok(comb.disclaimer.includes('does not claim absolute uniqueness'));
+      },
+    },
+    {
+      name: '[P4 Test C] Strict Non-Redaction Guardrail for Ordinary Contextual Text',
+      fn: async () => {
+        // Document containing both direct PII and prominent surrounding labels/quasi-identifiers
+        const pdfDoc = await PDFDocument.create();
+        const font = await pdfDoc.embedFont(StandardFonts.Helvetica);
+        const page = pdfDoc.addPage([595.28, 841.89]);
+
+        page.drawText('Applicant PAN: ABCDE1234F', { x: 50, y: 720, size: 12, font });
+        page.drawText('Designation: Senior Consultant Surgeon', { x: 50, y: 660, size: 12, font });
+        page.drawText('Affiliation: City General Hospital', { x: 50, y: 600, size: 12, font });
+
+        const buf = Buffer.from(await pdfDoc.save());
+        const up = await uploadCustomPdfBuffer(buf, 'p4_test_c_guardrail.pdf');
+        assert.strictEqual(up.status, 201);
+        const docId = up.body.documentId;
+
+        // Run automatic redaction
+        const redRes = await fetch(`${baseUrl}/api/redact`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ documentId: docId, mode: 'automatic' }),
+        });
+        const redBody = await redRes.json();
+        assert.strictEqual(redRes.status, 200);
+
+        // Guardrail assertion: only the direct PAN is redacted, NOT the ordinary context lines
+        assert.strictEqual(redBody.selectedForRedactionCount, 1, 'Only the direct sensitive PAN should be redacted');
+        assert.strictEqual(redBody.maskGeometryAudit.length, 1);
+
+        // Verify via OCR that PAN was redacted while surrounding labels and quasi-identifiers remain intact
+        const rec = getDocumentRecord(docId);
+        const postExt = await extractPdfContent(rec.redactedFilePath, { forceOcr: true });
+        const ocrText = (postExt.pages[0]?.text || '').toLowerCase();
+
+        assert.strictEqual(ocrText.includes('abcde1234f'), false, 'Direct PAN value must be permanently redacted');
+        assert.strictEqual(
+          ocrText.includes('senior consultant') || ocrText.includes('surgeon'),
+          true,
+          `Ordinary role text must NOT be automatically or silently redacted (got OCR: "${ocrText}")`
+        );
+        assert.strictEqual(
+          ocrText.includes('city general') || ocrText.includes('hospital'),
+          true,
+          `Ordinary organization text must NOT be automatically or silently redacted (got OCR: "${ocrText}")`
+        );
+      },
+    },
+    {
+      name: '[P4 Test D] Empirical Mask-Size Calibration Comparison: Standard vs Compact Under Identical Fixtures',
+      fn: async () => {
+        // Construct identical test PDF fixture with:
+        // - Item 1 (PAN): in a dense column layout where adjacent text starts at x = 215 pt (available clearance ~128 pt).
+        //   Under standard (240pt target), 128pt < 240pt -> blocked, falls back to un-obfuscated width.
+        //   Under compact (120pt target), 128pt >= 120pt -> successfully obfuscates to 120pt without touching neighbor text.
+        // - Item 2 (Phone): on an open line with 400+ pt clearance.
+        async function buildFixturePdf() {
+          const pdfDoc = await PDFDocument.create();
+          const font = await pdfDoc.embedFont(StandardFonts.Helvetica);
+          const page = pdfDoc.addPage([595.28, 841.89]);
+          page.drawText('PAN: ABCDE1234F', { x: 50, y: 720, size: 12, font });
+          page.drawText('Score: 98/100   Status: Confirmed', { x: 215, y: 720, size: 12, font });
+          page.drawText('Phone: +91 9876543210', { x: 50, y: 640, size: 12, font });
+          return Buffer.from(await pdfDoc.save());
+        }
+
+        // --- Run 1: Default 'standard' profile [240, 360, 480] pt ---
+        const bufStd = await buildFixturePdf();
+        const upStd = await uploadCustomPdfBuffer(bufStd, 'p4_calib_standard.pdf');
+        assert.strictEqual(upStd.status, 201);
+        const docIdStd = upStd.body.documentId;
+
+        await fetch(`${baseUrl}/api/detect`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ documentId: docIdStd }),
+        });
+
+        const redStdRes = await fetch(`${baseUrl}/api/redact`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            documentId: docIdStd,
+            mode: 'automatic',
+            // Default: 'standard' profile
+          }),
+        });
+        const redStdBody = await redStdRes.json();
+        assert.strictEqual(redStdRes.status, 200);
+        assert.strictEqual(redStdBody.maskProfile, 'standard');
+        assert.strictEqual(redStdBody.obfuscationStrategy, MASK_OBFUSCATION_STRATEGY);
+
+        const panAuditStd = redStdBody.maskGeometryAudit.find((a) => a.category === 'NATIONAL_ID_PAN');
+        const phoneAuditStd = redStdBody.maskGeometryAudit.find((a) => a.category === 'PHONE_NUMBER');
+        assert.ok(panAuditStd && phoneAuditStd);
+
+        // Standard profile: 240pt cannot fit in ~128pt clearance before x=215, so expansion is safely blocked
+        assert.strictEqual(panAuditStd.maskObfuscationApplied, false);
+        assert.strictEqual(panAuditStd.obfuscationStatus, 'UNSAFE_EXPANSION_BLOCKED');
+        assert.ok(panAuditStd.finalMaskBoundingBox.width < 100, 'Falls back to constrained un-obfuscated width');
+
+        // On open line: standard 240pt bucket succeeds
+        assert.strictEqual(phoneAuditStd.maskObfuscationApplied, true);
+        assert.strictEqual(phoneAuditStd.finalMaskBoundingBox.width, 240);
+
+        // --- Run 2: Explicitly selected 'compact' profile [120, 160, 240] pt ---
+        const bufCmp = await buildFixturePdf();
+        const upCmp = await uploadCustomPdfBuffer(bufCmp, 'p4_calib_compact.pdf');
+        assert.strictEqual(upCmp.status, 201);
+        const docIdCmp = upCmp.body.documentId;
+
+        await fetch(`${baseUrl}/api/detect`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ documentId: docIdCmp }),
+        });
+
+        const redCmpRes = await fetch(`${baseUrl}/api/redact`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            documentId: docIdCmp,
+            mode: 'automatic',
+            maskProfile: 'compact',
+          }),
+        });
+        const redCmpBody = await redCmpRes.json();
+        assert.strictEqual(redCmpRes.status, 200);
+        assert.strictEqual(redCmpBody.maskProfile, 'compact');
+        assert.strictEqual(redCmpBody.obfuscationStrategy, COMPACT_MASK_OBFUSCATION_STRATEGY);
+
+        const panAuditCmp = redCmpBody.maskGeometryAudit.find((a) => a.category === 'NATIONAL_ID_PAN');
+        const phoneAuditCmp = redCmpBody.maskGeometryAudit.find((a) => a.category === 'PHONE_NUMBER');
+        assert.ok(panAuditCmp && phoneAuditCmp);
+
+        // Compact profile: 120pt fits safely in ~128pt clearance, achieving dimension obfuscation where standard failed
+        assert.strictEqual(panAuditCmp.maskObfuscationApplied, true);
+        assert.strictEqual(panAuditCmp.obfuscationStatus, 'OBFUSCATED');
+        assert.strictEqual(panAuditCmp.finalMaskBoundingBox.width, 120);
+        assert.ok(
+          panAuditCmp.finalMaskBoundingBox.x + panAuditCmp.finalMaskBoundingBox.width <= 215,
+          'Compact mask must not intrude into neighbor text at x=215'
+        );
+
+        // On open line under compact profile, Phone standardizes to 120pt (not 240pt)
+        assert.strictEqual(phoneAuditCmp.maskObfuscationApplied, true);
+        assert.strictEqual(phoneAuditCmp.finalMaskBoundingBox.width, 120);
+
+        // OCR verification on both exported PDFs: neighbor content "Score: 98/100" remains readable in both
+        const recStd = getDocumentRecord(docIdStd);
+        const postStd = await extractPdfContent(recStd.redactedFilePath, { forceOcr: true });
+        const textStd = (postStd.pages[0]?.text || '').toLowerCase();
+        assert.strictEqual(textStd.includes('abcde1234f'), false);
+        assert.strictEqual(textStd.includes('score') || textStd.includes('98/100'), true);
+
+        const recCmp = getDocumentRecord(docIdCmp);
+        const postCmp = await extractPdfContent(recCmp.redactedFilePath, { forceOcr: true });
+        const textCmp = (postCmp.pages[0]?.text || '').toLowerCase();
+        assert.strictEqual(textCmp.includes('abcde1234f'), false);
+        assert.strictEqual(textCmp.includes('score') || textCmp.includes('98/100'), true);
+
+        // --- Run 3: Validation - Invalid profile name rejection ---
+        const invalidRes = await fetch(`${baseUrl}/api/redact`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            documentId: docIdCmp,
+            mode: 'automatic',
+            maskProfile: 'nonexistent-profile-xyz',
+          }),
+        });
+        const invalidBody = await invalidRes.json();
+        assert.strictEqual(invalidRes.status, 400);
+        assert.strictEqual(invalidBody.error, 'INVALID_MASK_PROFILE');
+      },
+    },
+    {
+      name: '[P4 Test E] Mask-Size Calibration on Scanned & Hybrid PDFs with Validated Profile Selection',
+      fn: async () => {
+        // Create an embedded image containing a synthetic phone number
+        const imgCanvas = createCanvas(700, 180);
+        const imgCtx = imgCanvas.getContext('2d');
+        imgCtx.fillStyle = '#ffffff';
+        imgCtx.fillRect(0, 0, 700, 180);
+        imgCtx.fillStyle = '#000000';
+        imgCtx.font = 'bold 28px sans-serif';
+        imgCtx.fillText('Hybrid Scanned PAN: ABCDE1234F', 30, 95);
+        const pngBytes = imgCanvas.toBuffer('image/png');
+
+        const pdfDoc = await PDFDocument.create();
+        const font = await pdfDoc.embedFont(StandardFonts.Helvetica);
+        const page = pdfDoc.addPage([595.28, 841.89]);
+
+        page.drawText('HYBRID DOCUMENT RECORD (SYNTHETIC)', { x: 50, y: 760, size: 14, font });
+        page.drawText('Selectable Text Phone: +91 9876543210', { x: 50, y: 700, size: 12, font });
+
+        const embeddedPng = await pdfDoc.embedPng(pngBytes);
+        page.drawImage(embeddedPng, {
+          x: 50,
+          y: 480,
+          width: 350,
+          height: 90,
+        });
+
+        const buf = Buffer.from(await pdfDoc.save());
+        const up = await uploadCustomPdfBuffer(buf, 'p4_hybrid_calib.pdf');
+        assert.strictEqual(up.status, 201);
+        const docId = up.body.documentId;
+
+        await fetch(`${baseUrl}/api/detect`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ documentId: docId }),
+        });
+
+        // Redact using compact profile
+        const redRes = await fetch(`${baseUrl}/api/redact`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            documentId: docId,
+            mode: 'automatic',
+            maskProfile: 'compact',
+          }),
+        });
+        const redBody = await redRes.json();
+        assert.strictEqual(redRes.status, 200);
+        assert.strictEqual(redBody.maskProfile, 'compact');
+        assert.strictEqual(redBody.maskObfuscationApplied, true);
+
+        // Both selectable Phone and image-OCR PAN must standardize to 120pt compact width
+        for (const item of redBody.maskGeometryAudit) {
+          assert.strictEqual(item.maskObfuscationApplied, true);
+          assert.strictEqual(item.finalMaskBoundingBox.width, 120);
+          assert.strictEqual(item.obfuscationStrategy, COMPACT_MASK_OBFUSCATION_STRATEGY);
+        }
+
+        // Verify via OCR that all items are permanently removed
+        const verRes = await fetch(`${baseUrl}/api/verify`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ documentId: docId, runOcrCheck: true }),
+        });
+        const verBody = await verRes.json();
+        assert.strictEqual(verRes.status, 200);
+        assert.strictEqual(verBody.verified, true);
+        assert.strictEqual(verBody.verification.selectedStillDetectableCount, 0);
+      },
+    },
+    {
+      name: '[P4 Test F] End-to-End Privacy Assessment Report with Sanitized Contextual Risk Audit',
+      fn: async () => {
+        const pdfDoc = await PDFDocument.create();
+        const font = await pdfDoc.embedFont(StandardFonts.Helvetica);
+        const page = pdfDoc.addPage([595.28, 841.89]);
+
+        page.drawText('Permanent Account Number (PAN): ABCDE1234F', { x: 50, y: 720, size: 12, font });
+        page.drawText('Institution: Fictional Institute of Technology, Bengaluru', { x: 50, y: 670, size: 12, font });
+
+        const buf = Buffer.from(await pdfDoc.save());
+        const up = await uploadCustomPdfBuffer(buf, 'p4_report_contextual.pdf');
+        assert.strictEqual(up.status, 201);
+        const docId = up.body.documentId;
+
+        await fetch(`${baseUrl}/api/detect`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ documentId: docId }),
+        });
+
+        await fetch(`${baseUrl}/api/redact`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ documentId: docId, mode: 'automatic' }),
+        });
+
+        const verRes = await fetch(`${baseUrl}/api/verify`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ documentId: docId, runOcrCheck: true }),
+        });
+        const verBody = await verRes.json();
+        assert.strictEqual(verRes.status, 200);
+        assert.ok(verBody.reportId);
+
+        // Retrieve privacy assessment report
+        const repRes = await fetch(`${baseUrl}/api/report/${verBody.reportId}`);
+        const repBody = await repRes.json();
+        assert.strictEqual(repRes.status, 200);
+        assert.ok(repBody.report);
+        const report = repBody.report;
+
+        // Contextual privacy assessment must be included in report
+        assert.ok(report.contextualPrivacyAssessment);
+        const cpa = report.contextualPrivacyAssessment;
+        assert.strictEqual(cpa.hasContextualRisks, true);
+        assert.ok(cpa.labelExposureCount >= 1);
+        assert.ok(cpa.labelExposures.length > 0);
+        assert.ok(report.beforeAndAfterAssessment.summary.includes('category lead-in label exposure'));
+
+        // Never expose raw sensitive values (ABCDE1234F) in report metadata or audit
+        const reportJsonStr = JSON.stringify(report);
+        assert.strictEqual(
+          reportJsonStr.includes('ABCDE1234F'),
+          false,
+          'Privacy assessment report must NEVER expose raw sensitive values'
+        );
+
+        // Integrity hash must be verified
+        assert.ok(report.exportedDocumentIntegrity.sha256);
+        assert.strictEqual(report.exportedDocumentIntegrity.algorithm, 'SHA-256');
       },
     },
   ];

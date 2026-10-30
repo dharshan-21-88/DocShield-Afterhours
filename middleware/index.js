@@ -11,7 +11,7 @@ import { ensureTempDirs, safeDeleteFile } from '../config/storage.js';
  */
 export const apiRateLimiter = rateLimit({
   windowMs: config.rateLimit.windowMs,
-  max: config.rateLimit.maxRequests,
+  max: () => config.rateLimit.maxRequests,
   standardHeaders: true,
   legacyHeaders: false,
   message: {

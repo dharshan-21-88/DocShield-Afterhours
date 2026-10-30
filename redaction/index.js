@@ -34,6 +34,35 @@ export const STANDARD_MASK_WIDTH_BUCKETS_PT = [240, 360, 480];
 export const STANDARD_MASK_HEIGHT_BUCKETS_PT = [22, 34, 48];
 export const MASK_OBFUSCATION_STRATEGY = 'standardized-bucket-obfuscation-v1';
 
+export const COMPACT_MASK_WIDTH_BUCKETS_PT = [120, 160, 240];
+export const COMPACT_MASK_HEIGHT_BUCKETS_PT = [18, 26, 36];
+export const COMPACT_MASK_OBFUSCATION_STRATEGY = 'standardized-bucket-compact-v1';
+
+export const MASK_OBFUSCATION_PROFILES = {
+  standard: {
+    name: 'standard',
+    strategy: MASK_OBFUSCATION_STRATEGY,
+    widthBucketsPt: STANDARD_MASK_WIDTH_BUCKETS_PT,
+    heightBucketsPt: STANDARD_MASK_HEIGHT_BUCKETS_PT,
+    description: 'Default standardized wide buckets providing high length ambiguity on open layouts (240/360/480 pt)',
+  },
+  compact: {
+    name: 'compact',
+    strategy: COMPACT_MASK_OBFUSCATION_STRATEGY,
+    widthBucketsPt: COMPACT_MASK_WIDTH_BUCKETS_PT,
+    heightBucketsPt: COMPACT_MASK_HEIGHT_BUCKETS_PT,
+    description: 'Experimental compact standardized buckets calibrated for dense layouts and multi-column forms (120/160/240 pt)',
+  },
+};
+
+export const DEFAULT_MASK_PROFILE = 'standard';
+
+export function getMaskProfile(profileName = DEFAULT_MASK_PROFILE) {
+  if (!profileName) return MASK_OBFUSCATION_PROFILES[DEFAULT_MASK_PROFILE];
+  const normalized = String(profileName).trim().toLowerCase();
+  return MASK_OBFUSCATION_PROFILES[normalized] || null;
+}
+
 function round2(val) {
   return Number(Number(val).toFixed(2));
 }
@@ -53,13 +82,15 @@ function cloneBox(box) {
  * Selects a standardized mask width bucket in PDF points based purely on bounding-box
  * geometry (never derived from sensitive string character length).
  */
-export function selectStandardizedWidthBucket(paddedWidth, pageWidth = 595.28) {
-  for (const bucket of STANDARD_MASK_WIDTH_BUCKETS_PT) {
+export function selectStandardizedWidthBucket(paddedWidth, pageWidth = 595.28, widthBuckets = STANDARD_MASK_WIDTH_BUCKETS_PT) {
+  const buckets = Array.isArray(widthBuckets) && widthBuckets.length > 0 ? widthBuckets : STANDARD_MASK_WIDTH_BUCKETS_PT;
+  for (const bucket of buckets) {
     if (paddedWidth <= bucket) {
       return bucket;
     }
   }
-  const quantized = Math.ceil(paddedWidth / 60) * 60;
+  const step = buckets[0] && buckets[0] <= 120 ? 30 : 60;
+  const quantized = Math.ceil(paddedWidth / step) * step;
   return Math.max(paddedWidth, Math.min(quantized, Math.max(paddedWidth, pageWidth - 16)));
 }
 
@@ -67,8 +98,9 @@ export function selectStandardizedWidthBucket(paddedWidth, pageWidth = 595.28) {
  * Selects a standardized mask height bucket in PDF points based purely on bounding-box
  * geometry.
  */
-export function selectStandardizedHeightBucket(paddedHeight, pageHeight = 841.89) {
-  for (const bucket of STANDARD_MASK_HEIGHT_BUCKETS_PT) {
+export function selectStandardizedHeightBucket(paddedHeight, pageHeight = 841.89, heightBuckets = STANDARD_MASK_HEIGHT_BUCKETS_PT) {
+  const buckets = Array.isArray(heightBuckets) && heightBuckets.length > 0 ? heightBuckets : STANDARD_MASK_HEIGHT_BUCKETS_PT;
+  for (const bucket of buckets) {
     if (paddedHeight <= bucket) {
       return bucket;
     }
@@ -257,12 +289,25 @@ export function buildPageObstaclesForItem({
  * @param {Object} options - `{ pageDimensions, obstacles, glyphCoverageBox, padX, padY, itemMetadata }`
  */
 export function computeObfuscatedMaskGeometry(originalBox, options = {}) {
+  const profileName = options.maskProfile || options.profile || DEFAULT_MASK_PROFILE;
+  const activeProfile = getMaskProfile(profileName);
+  if (!activeProfile) {
+    const err = new Error(`INVALID_MASK_PROFILE: Unknown mask profile "${profileName}". Available profiles are: standard, compact.`);
+    err.code = 'INVALID_MASK_PROFILE';
+    err.statusCode = 400;
+    throw err;
+  }
+  const strategy = activeProfile.strategy;
+  const widthBuckets = activeProfile.widthBucketsPt;
+  const heightBuckets = activeProfile.heightBucketsPt;
+
   const orig = cloneBox(originalBox);
   if (!orig) {
     return {
       maskObfuscationApplied: false,
       obfuscationStatus: 'INVALID_COORDINATES',
-      obfuscationStrategy: MASK_OBFUSCATION_STRATEGY,
+      obfuscationStrategy: strategy,
+      maskProfile: activeProfile.name,
       originalBoundingBox: null,
       finalMaskBoundingBox: null,
       targetBucket: null,
@@ -324,8 +369,8 @@ export function computeObfuscatedMaskGeometry(originalBox, options = {}) {
   const paddedWidth = Math.max(1, baseRight - baseLeft);
   const paddedHeight = Math.max(1, baseBottom - baseTop);
 
-  const targetWidth = selectStandardizedWidthBucket(paddedWidth, pageWidth);
-  const targetHeight = selectStandardizedHeightBucket(paddedHeight, pageHeight);
+  const targetWidth = selectStandardizedWidthBucket(paddedWidth, pageWidth, widthBuckets);
+  const targetHeight = selectStandardizedHeightBucket(paddedHeight, pageHeight, heightBuckets);
 
   // Compute safe horizontal expansion interval [minSafeX, maxSafeRightX] around [baseLeft, baseRight]
   let minSafeX = Math.min(baseLeft, 8);
@@ -412,7 +457,8 @@ export function computeObfuscatedMaskGeometry(originalBox, options = {}) {
     return {
       maskObfuscationApplied: true,
       obfuscationStatus: 'OBFUSCATED',
-      obfuscationStrategy: MASK_OBFUSCATION_STRATEGY,
+      obfuscationStrategy: strategy,
+      maskProfile: activeProfile.name,
       originalBoundingBox: orig,
       finalMaskBoundingBox: {
         x: round2(finalLeft),
@@ -460,6 +506,7 @@ export function computeObfuscatedMaskGeometry(originalBox, options = {}) {
     category: meta.category || null,
     categoryLabel: meta.categoryLabel || null,
     source: meta.source || null,
+    maskProfile: activeProfile.name,
     originalWidth: orig.width,
     targetBucketWidth: targetWidth,
     availableSafeWidth: round2(availableSafeWidth),
@@ -470,7 +517,8 @@ export function computeObfuscatedMaskGeometry(originalBox, options = {}) {
   return {
     maskObfuscationApplied: false,
     obfuscationStatus: 'UNSAFE_EXPANSION_BLOCKED',
-    obfuscationStrategy: MASK_OBFUSCATION_STRATEGY,
+    obfuscationStrategy: strategy,
+    maskProfile: activeProfile.name,
     originalBoundingBox: orig,
     finalMaskBoundingBox: {
       x: round2(baseLeft),
@@ -510,6 +558,19 @@ export async function generatePermanentlyRedactedPdf(
   options = {}
 ) {
   await ensureTempDirs();
+
+  const profileName = options.maskProfile || options.profile || DEFAULT_MASK_PROFILE;
+  const activeProfile = getMaskProfile(profileName);
+  if (!activeProfile) {
+    const err = new Error(
+      `INVALID_MASK_PROFILE: Unknown mask profile "${profileName}". Allowed profiles are: "standard", "compact".`
+    );
+    err.code = 'INVALID_MASK_PROFILE';
+    err.statusCode = 400;
+    throw err;
+  }
+  const activeStrategy = activeProfile.strategy;
+  const activeProfileName = activeProfile.name;
 
   const rawBuffer = await fs.readFile(originalPdfPath);
   const uint8Array = new Uint8Array(rawBuffer);
@@ -774,6 +835,7 @@ export async function generatePermanentlyRedactedPdf(
             obstacles,
             padX,
             padY,
+            maskProfile: activeProfileName,
             itemMetadata: sanitizedItemMeta,
           });
           origSegs.push(geom.originalBoundingBox);
@@ -811,9 +873,10 @@ export async function generatePermanentlyRedactedPdf(
             categoryLabel: sanitizedItemMeta.categoryLabel,
             maskedText: sanitizedItemMeta.maskedText,
             source: sanitizedItemMeta.source,
+            maskProfile: activeProfileName,
             maskObfuscationApplied: allSegsObfuscated,
             obfuscationStatus: allSegsObfuscated ? 'OBFUSCATED' : 'UNSAFE_EXPANSION_BLOCKED',
-            obfuscationStrategy: MASK_OBFUSCATION_STRATEGY,
+            obfuscationStrategy: activeStrategy,
             originalBoundingBox: cloneBox(item.boundingBox) || origSegs[0],
             originalBoundingBoxes: origSegs,
             finalMaskBoundingBox: {
@@ -844,6 +907,7 @@ export async function generatePermanentlyRedactedPdf(
           glyphCoverageBox,
           padX,
           padY,
+          maskProfile: activeProfileName,
           itemMetadata: sanitizedItemMeta,
         });
 
@@ -869,9 +933,10 @@ export async function generatePermanentlyRedactedPdf(
           categoryLabel: sanitizedItemMeta.categoryLabel,
           maskedText: sanitizedItemMeta.maskedText,
           source: sanitizedItemMeta.source,
+          maskProfile: activeProfileName,
           maskObfuscationApplied: geom.maskObfuscationApplied,
           obfuscationStatus: geom.obfuscationStatus,
-          obfuscationStrategy: MASK_OBFUSCATION_STRATEGY,
+          obfuscationStrategy: activeStrategy,
           originalBoundingBox: geom.originalBoundingBox,
           finalMaskBoundingBox: geom.finalMaskBoundingBox,
           targetBucket: geom.targetBucket,
@@ -928,7 +993,8 @@ export async function generatePermanentlyRedactedPdf(
     err.statusCode = 422;
     err.details = {
       blockedCount: obfuscationWarnings.length,
-      obfuscationStrategy: MASK_OBFUSCATION_STRATEGY,
+      maskProfile: activeProfileName,
+      obfuscationStrategy: activeStrategy,
       obfuscationWarnings,
       maskGeometryAudit,
     };
@@ -967,15 +1033,17 @@ export async function generatePermanentlyRedactedPdf(
     fileSizeBytes: redactedBuffer.length,
     sha256,
     pageCount: numPages,
+    maskProfile: activeProfileName,
     maskObfuscationApplied,
     obfuscationStatus,
-    obfuscationStrategy: MASK_OBFUSCATION_STRATEGY,
+    obfuscationStrategy: activeStrategy,
     obfuscationWarnings,
     maskGeometryAudit,
     maskObfuscationSummary: {
+      maskProfile: activeProfileName,
       maskObfuscationApplied,
       obfuscationStatus,
-      obfuscationStrategy: MASK_OBFUSCATION_STRATEGY,
+      obfuscationStrategy: activeStrategy,
       totalRedactedItems: totalAudited,
       obfuscatedItemsCount: obfuscatedCount,
       constrainedItemsCount: blockedCount,

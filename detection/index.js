@@ -23,6 +23,15 @@ export const SENSITIVE_CATEGORIES = {
   FINANCIAL_ACCOUNT: 'Financial Account / Banking Identifier',
 };
 
+export {
+  analyzeContextualPrivacy,
+  detectCategoryLabelExposures,
+  extractQuasiIdentifiers,
+  evaluateQuasiIdentifierCombinations,
+  CONTEXTUAL_CATEGORIES,
+  QUASI_IDENTIFIER_TYPES,
+} from './contextual.js';
+
 const DETECTION_PATTERNS = [
   {
     category: 'EMAIL_ADDRESS',

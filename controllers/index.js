@@ -13,6 +13,7 @@ import {
 import { extractPdfContent } from '../extraction/index.js';
 import { SAMPLE_SCENARIOS, generateSamplePdfFile } from '../extraction/samples.js';
 import { detectSensitiveInfo, findBoundingBoxForMatch } from '../detection/index.js';
+import { analyzeContextualPrivacy } from '../detection/contextual.js';
 import { generatePermanentlyRedactedPdf, hasValidItemCoordinates } from '../redaction/index.js';
 import { verifyRedactedPdf } from '../verification/index.js';
 import { buildPrivacyAssessmentReport } from '../reports/index.js';
@@ -169,11 +170,16 @@ export async function detectSensitiveController(req, res, next) {
     }
 
     const detectionResult = detectSensitiveInfo(docRecord.extraction, categories);
+    const contextualPrivacy = analyzeContextualPrivacy({
+      extraction: docRecord.extraction,
+      detectedItems: detectionResult.items,
+    });
 
     updateDocumentRecord(documentId, {
       detectedItems: detectionResult.items,
       categoryBreakdown: detectionResult.categoryBreakdown,
       structuralAudit: detectionResult.structuralAudit,
+      contextualPrivacy,
     });
 
     res.status(200).json({
@@ -184,6 +190,7 @@ export async function detectSensitiveController(req, res, next) {
       disclaimer: detectionResult.disclaimer,
       items: detectionResult.items,
       structuralAudit: detectionResult.structuralAudit,
+      contextualPrivacy,
       ...(detectionResult.unsupportedAnnotations ? { unsupportedAnnotations: detectionResult.unsupportedAnnotations } : {}),
       ...(detectionResult.linkAnnotations ? { linkAnnotations: detectionResult.linkAnnotations } : {}),
     });
@@ -202,6 +209,7 @@ export async function redactPdfController(req, res, next) {
       mode = 'automatic',
       selectedItemIds,
       failOnUnsafeObfuscation = false,
+      maskProfile,
     } = req.body || {};
 
     if (!documentId || typeof documentId !== 'string') {
@@ -209,6 +217,14 @@ export async function redactPdfController(req, res, next) {
         success: false,
         error: 'MISSING_DOCUMENT_ID',
         message: 'Please provide a valid "documentId" in the request body.',
+      });
+    }
+
+    if (maskProfile && !['standard', 'compact'].includes(String(maskProfile).toLowerCase())) {
+      return res.status(400).json({
+        success: false,
+        error: 'INVALID_MASK_PROFILE',
+        message: `Invalid maskProfile "${maskProfile}". Allowed profiles are: "standard", "compact".`,
       });
     }
 
@@ -285,6 +301,7 @@ export async function redactPdfController(req, res, next) {
         allDetectedItems: detectedItems,
         extraction: docRecord.extraction,
         failOnUnsafeObfuscation: Boolean(failOnUnsafeObfuscation),
+        ...(maskProfile ? { maskProfile: String(maskProfile).toLowerCase() } : {}),
       }
     );
 
@@ -300,6 +317,7 @@ export async function redactPdfController(req, res, next) {
       redactedFilePath: redactionOutput.redactedFilePath,
       redactedSha256: redactionOutput.sha256,
       redactedFileSizeBytes: redactionOutput.fileSizeBytes,
+      maskProfile: redactionOutput.maskProfile,
       maskObfuscation: redactionOutput.maskObfuscationSummary,
       maskGeometryAudit: redactionOutput.maskGeometryAudit,
     });
@@ -308,6 +326,7 @@ export async function redactPdfController(req, res, next) {
       success: true,
       documentId,
       mode,
+      maskProfile: redactionOutput.maskProfile,
       totalDetectedBeforeRedaction: detectedItems.length,
       selectedForRedactionCount: itemsToRedact.length,
       unselectedCount: Math.max(0, detectedItems.length - itemsToRedact.length),
@@ -357,6 +376,16 @@ export async function verifyPdfController(req, res, next) {
         success: false,
         error: 'REDACTED_PDF_NOT_READY',
         message: 'Please call POST /api/redact to generate a redacted PDF before running POST /api/verify.',
+      });
+    }
+
+    if (!docRecord.contextualPrivacy && docRecord.extraction) {
+      docRecord.contextualPrivacy = analyzeContextualPrivacy({
+        extraction: docRecord.extraction,
+        detectedItems: docRecord.detectedItems || [],
+      });
+      updateDocumentRecord(documentId, {
+        contextualPrivacy: docRecord.contextualPrivacy,
       });
     }
 
