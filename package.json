@@ -4,11 +4,12 @@
   "version": "0.0.0",
   "type": "module",
   "scripts": {
-    "dev": "node server.js",
+    "dev": "vite --host 0.0.0.0",
     "start": "node server.js",
-    "build": "echo 'Backend-only project: no frontend build required'",
+    "build": "vite build",
     "test": "node tests/run-tests.js",
-    "lint": "node --check server.js"
+    "lint": "node --check server.js",
+    "dev:api": "node server.js"
   },
   "dependencies": {
     "@google/genai": "^2.4.0",
