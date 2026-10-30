@@ -63,6 +63,10 @@ export async function renderPageToCanvas(page, scale = 2.0) {
 function extractOcrElementsFromData(ocrData, ocrScale) {
   const ocrElements = [];
   const blocks = ocrData?.blocks || [];
+  if (blocks.length > 0 && !Array.isArray(blocks[0]?.paragraphs)) {
+    console.warn('[DocShield] blocks structure incompatible with expected v6+ format');
+    return ocrElements;
+  }
 
   for (const block of blocks) {
     const paragraphs = block?.paragraphs || [];
@@ -224,7 +228,7 @@ export async function extractPdfContent(filePath, options = {}) {
         }
 
         // Request blocks: true so Tesseract.js v7 populates blocks -> paragraphs -> lines -> words with bboxes
-        const ocrResult = await ocrWorker.recognize(imageBuffer, {}, { blocks: true });
+        const ocrResult = await ocrWorker.recognize(imageBuffer, {}, { text: true, blocks: true });
         const ocrData = ocrResult?.data || {};
         const ocrText = (ocrData.text || '').trim();
 
