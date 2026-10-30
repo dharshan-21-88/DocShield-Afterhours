@@ -476,7 +476,7 @@ async function extractPageAnnotations(page, viewport, pageNum) {
  * so all byte offsets (`startxref`, `/Prev`, `xref`, object offsets) remain 100% identical while preventing
  * compressed stream bytes from producing false structural token matches.
  */
-function maskBinaryStreamsPreservingOffsets(rawPdfLatin1) {
+export function maskBinaryStreamsPreservingOffsets(rawPdfLatin1) {
   return rawPdfLatin1.replace(/(stream(?:\r\n|\n|\r))([\s\S]*?)((?:\r\n|\n|\r)?endstream)/g, (_m, p1, body, p3) => {
     return p1 + ' '.repeat(body.length) + p3;
   });
@@ -636,7 +636,7 @@ function extractReadableStringsFromPdfSegment(segmentLatin1) {
 /**
  * Inspect PDF document metadata (`/Info` standard & custom fields + XMP metadata stream).
  */
-async function inspectPdfMetadataStructure(pdfDoc, rawPdfLatin1) {
+export async function inspectPdfMetadataStructure(pdfDoc, rawPdfLatin1) {
   let pdfjsMeta = null;
   try {
     pdfjsMeta = await pdfDoc.getMetadata();
@@ -727,7 +727,7 @@ async function inspectPdfMetadataStructure(pdfDoc, rawPdfLatin1) {
  * 2. Page-level `FileAttachment` annotations collected from `page.getAnnotations()`.
  * 3. Catalog `/AF` (Associated Files), `/Collection` (PDF Portfolio), and raw `/Filespec` dictionaries.
  */
-async function inspectPdfAttachmentStructure(pdfDoc, pageFileAttachments, metaInfo, nonStreamPdfLatin1) {
+export async function inspectPdfAttachmentStructure(pdfDoc, pageFileAttachments, metaInfo, nonStreamPdfLatin1) {
   const items = [];
   const seenKeys = new Set();
 
@@ -841,7 +841,7 @@ async function inspectPdfAttachmentStructure(pdfDoc, pageFileAttachments, metaIn
  * Inspect raw PDF structure for incremental save revisions, `/Prev` trailer chains, `startxref` markers,
  * cross-reference tables/streams, linearized PDF structures, and malformed revision anomalies.
  */
-function inspectPdfRevisionStructure(dataBuffer, rawPdfLatin1, nonStreamPdfLatin1, metaInfo) {
+export function inspectPdfRevisionStructure(dataBuffer, rawPdfLatin1, nonStreamPdfLatin1, metaInfo) {
   const fileSize = dataBuffer.length;
   const headerSlice = nonStreamPdfLatin1.slice(0, Math.min(fileSize, 4096));
 
@@ -1093,7 +1093,7 @@ function inspectPdfRevisionStructure(dataBuffer, rawPdfLatin1, nonStreamPdfLatin
 /**
  * Perform complete P2.2 hidden-structure inspection (metadata, XMP, attachments, incremental revisions).
  */
-async function inspectPdfHiddenStructures(pdfDoc, dataBuffer, pageFileAttachments) {
+export async function inspectPdfHiddenStructures(pdfDoc, dataBuffer, pageFileAttachments) {
   const rawPdfLatin1 = dataBuffer.toString('latin1');
   const nonStreamPdfLatin1 = maskBinaryStreamsPreservingOffsets(rawPdfLatin1);
 

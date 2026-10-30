@@ -137,9 +137,12 @@ export async function generatePermanentlyRedactedPdf(originalPdfPath, itemsToRed
 
   // Create a brand new, empty PDF document via pdf-lib (contains zero original text objects)
   const outputPdf = await PDFDocument.create();
+  const exportTimestamp = new Date();
   outputPdf.setTitle('DocShield Protected Document');
+  outputPdf.setCreator('DocShield – Smart Document Privacy Protector');
   outputPdf.setProducer('DocShield – Smart Document Privacy Protector');
-  outputPdf.setCreationDate(new Date());
+  outputPdf.setCreationDate(exportTimestamp);
+  outputPdf.setModificationDate(exportTimestamp);
 
   const renderScale = 2.0; // 2x resolution for crisp readability of unredacted content
 

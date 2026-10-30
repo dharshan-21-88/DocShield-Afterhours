@@ -5,6 +5,7 @@ import { createCanvas } from '@napi-rs/canvas';
 import { createApp } from '../server.js';
 import { generateSamplePdfFile } from '../extraction/samples.js';
 import { extractPdfContent } from '../extraction/index.js';
+import { verifyRedactedPdf, verifyExportedPdfStructure } from '../verification/index.js';
 import { config } from '../config/index.js';
 import {
   getDocumentRecord,
@@ -2491,6 +2492,576 @@ async function runTests() {
           true,
           'Must emit INDETERMINATE_REVISION_STRUCTURE warning rather than a false clean result'
         );
+      },
+    },
+
+    // =========================================================================
+    // P2.3 POST-REDACTION STRUCTURAL VERIFICATION REGRESSION TESTS
+    // =========================================================================
+    {
+      name: '[P2.3 Test A] Sensitive Metadata, Custom /Info, and XMP Removed and Verified After Redaction',
+      fn: async () => {
+        const pdfDoc = await PDFDocument.create();
+        const font = await pdfDoc.embedFont(StandardFonts.Helvetica);
+        const page = pdfDoc.addPage([595.28, 841.89]);
+        page.drawText('Visible Student Aadhaar: 4829 7301 9482', {
+          x: 50,
+          y: 740,
+          size: 12,
+          font,
+        });
+
+        // Standard /Info metadata with sensitive PII
+        pdfDoc.setTitle('Confidential Financial & Identity Record');
+        pdfDoc.setAuthor('Ananya Sharma (ananya.sharma@fictional-univ.edu)');
+        pdfDoc.setSubject('Tax PAN ABCDE1234F and Mobile +91 9876543210');
+        pdfDoc.setKeywords(['IFSC SBIN0001234', 'REG-2026-CS-0492']);
+
+        // Custom /Info dictionary fields with sensitive PII
+        const infoDict = pdfDoc.getInfoDict();
+        infoDict.set(PDFName.of('EmployeePAN'), PDFString.of('ZXCVB9876K'));
+        infoDict.set(PDFName.of('BackupPhone'), PDFString.of('+91 9123456789'));
+
+        // Raw XMP /Metadata stream with sensitive PII
+        const xmpXml = `<?xpacket begin="" id="W5M0MpCehiHzreSzNTczkc9d"?>
+<x:xmpmeta xmlns:x="adobe:ns:meta/">
+  <rdf:RDF xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#">
+    <rdf:Description rdf:about="" xmlns:dc="http://purl.org/dc/elements/1.1/">
+      <dc:description>Hidden XMP Aadhaar 5839 2019 4821 and email xmp.secret@example.org</dc:description>
+    </rdf:Description>
+  </rdf:RDF>
+</x:xmpmeta>
+<?xpacket end="w"?>`;
+        const metaStream = pdfDoc.context.stream(xmpXml, {
+          Type: 'Metadata',
+          Subtype: 'XML',
+          Length: Buffer.byteLength(xmpXml, 'utf8'),
+        });
+        pdfDoc.catalog.set(PDFName.of('Metadata'), pdfDoc.context.register(metaStream));
+
+        const pdfBuffer = Buffer.from(await pdfDoc.save());
+        const up = await uploadCustomPdfBuffer(pdfBuffer, 'p23_metadata_xmp_test.pdf');
+        assert.strictEqual(up.status, 201);
+        const docId = up.body.documentId;
+
+        const detRes = await fetch(`${baseUrl}/api/detect`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ documentId: docId }),
+        });
+        const detBody = await detRes.json();
+        assert.strictEqual(detRes.status, 200);
+        assert.strictEqual(detBody.totalDetected, 1, 'Only the 1 on-page Aadhaar has page coordinates');
+        assert.ok(
+          detBody.structuralAudit.metadataDetections.length >= 6,
+          `Expected >= 6 metadata detections before redaction, got ${detBody.structuralAudit.metadataDetections.length}`
+        );
+
+        // Metadata detections without page coordinates must NOT cause false redaction failures
+        const redRes = await fetch(`${baseUrl}/api/redact`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ documentId: docId, mode: 'automatic' }),
+        });
+        assert.strictEqual(
+          redRes.status,
+          200,
+          'Automatic redaction must succeed and strip metadata by rebuilding the PDF'
+        );
+
+        const verRes = await fetch(`${baseUrl}/api/verify`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ documentId: docId, runOcrCheck: true }),
+        });
+        const verBody = await verRes.json();
+        assert.strictEqual(verRes.status, 200);
+
+        // Verify both OCR and Structural Verification pass and are separately visible
+        assert.strictEqual(verBody.verified, true);
+        assert.strictEqual(verBody.status, 'PASSED');
+        assert.strictEqual(verBody.ocrVerification.status, 'PASSED');
+        assert.strictEqual(verBody.structuralVerification.status, 'PASSED');
+
+        const metaCheck = verBody.structuralVerification.checks.metadata;
+        assert.strictEqual(metaCheck.status, 'PASSED');
+        assert.strictEqual(metaCheck.verified, true);
+        assert.strictEqual(metaCheck.hasXmpMetadata, false, 'XMP metadata must be absent in exported PDF');
+        assert.strictEqual(
+          metaCheck.survivingCustomFieldKeys.length,
+          0,
+          'Custom /Info entries must be absent in exported PDF'
+        );
+        assert.strictEqual(
+          metaCheck.unexpectedStandardFields.length,
+          0,
+          'No non-allowlisted standard metadata fields may survive'
+        );
+        assert.strictEqual(
+          metaCheck.survivingSensitiveMetadata.length,
+          0,
+          '0 sensitive metadata matches may survive in exported PDF'
+        );
+        assert.strictEqual(metaCheck.survivingOriginalMetadataCount, 0);
+        assert.ok(
+          metaCheck.originalSensitiveMetadataRemovedCount >= 6,
+          'Must confirm all original sensitive metadata items were removed'
+        );
+        assert.strictEqual(metaCheck.onlyAllowedDocShieldMetadataPresent, true);
+        assert.strictEqual(metaCheck.standardFields.Title, 'DocShield Protected Document');
+        assert.strictEqual(metaCheck.standardFields.Author, null);
+        assert.strictEqual(metaCheck.standardFields.Subject, null);
+        assert.strictEqual(metaCheck.standardFields.Keywords, null);
+      },
+    },
+    {
+      name: '[P2.3 Test B] Embedded Attachments & FileAttachment Annotations Removed and Verified (Prior Uninspected Content Reported)',
+      fn: async () => {
+        const pdfDoc = await PDFDocument.create();
+        const font = await pdfDoc.embedFont(StandardFonts.Helvetica);
+        const page = pdfDoc.addPage([595.28, 841.89]);
+        page.drawText('Document with catalog attachment and page FileAttachment annotation.', {
+          x: 50,
+          y: 740,
+          size: 12,
+          font,
+        });
+        page.drawText('Visible Phone: +91 9876543210', {
+          x: 50,
+          y: 700,
+          size: 12,
+          font,
+        });
+
+        // 1. Add catalog embedded attachment (/Names -> /EmbeddedFiles)
+        await pdfDoc.attach(
+          Buffer.from('uninspected catalog attachment payload', 'utf8'),
+          'aadhaar_4829-7301-9482_backup.txt',
+          {
+            mimeType: 'text/plain',
+            description: 'Catalog attachment for PAN ABCDE1234F',
+          }
+        );
+
+        // 2. Add page-level FileAttachment annotation
+        const embeddedStream = pdfDoc.context.flateStream('uninspected page attachment payload', {
+          Type: 'EmbeddedFile',
+          Subtype: 'application/pdf',
+        });
+        const filespecDict = pdfDoc.context.obj({
+          Type: 'Filespec',
+          F: PDFString.of('student_REG-2026-CS-0492_transcript.pdf'),
+          UF: PDFString.of('student_REG-2026-CS-0492_transcript.pdf'),
+          Desc: PDFString.of('Page FileAttachment annotation'),
+          EF: { F: pdfDoc.context.register(embeddedStream) },
+        });
+        const fileAttachAnnot = pdfDoc.context.obj({
+          Type: 'Annot',
+          Subtype: 'FileAttachment',
+          Rect: [80, 620, 104, 644],
+          FS: pdfDoc.context.register(filespecDict),
+          Contents: PDFString.of('Attached transcript file'),
+        });
+        page.node.addAnnot(pdfDoc.context.register(fileAttachAnnot));
+
+        const pdfBuffer = Buffer.from(await pdfDoc.save());
+        const up = await uploadCustomPdfBuffer(pdfBuffer, 'p23_attachments_test.pdf');
+        assert.strictEqual(up.status, 201);
+        const docId = up.body.documentId;
+
+        const detRes = await fetch(`${baseUrl}/api/detect`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ documentId: docId }),
+        });
+        const detBody = await detRes.json();
+        assert.strictEqual(detRes.status, 200);
+        assert.strictEqual(detBody.structuralAudit.attachments.totalCount, 2);
+
+        const redRes = await fetch(`${baseUrl}/api/redact`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ documentId: docId, mode: 'automatic' }),
+        });
+        assert.strictEqual(redRes.status, 200);
+
+        const verRes = await fetch(`${baseUrl}/api/verify`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ documentId: docId, runOcrCheck: true }),
+        });
+        const verBody = await verRes.json();
+        assert.strictEqual(verRes.status, 200);
+        assert.strictEqual(verBody.verified, true);
+        assert.strictEqual(verBody.structuralVerification.status, 'PASSED');
+
+        const attCheck = verBody.structuralVerification.checks.attachments;
+        assert.strictEqual(attCheck.status, 'PASSED');
+        assert.strictEqual(attCheck.verified, true);
+        assert.strictEqual(attCheck.remainingAttachmentCount, 0);
+        assert.strictEqual(attCheck.hasCatalogEmbeddedFilesNameTree, false);
+        assert.strictEqual(attCheck.isPortfolioCollection, false);
+        assert.strictEqual(attCheck.hasAssociatedFiles, false);
+
+        // Must explicitly report that original attachments had uninspected content before removal
+        assert.strictEqual(
+          attCheck.hadUninspectedAttachmentsBeforeRedaction,
+          true,
+          'Must flag hadUninspectedAttachmentsBeforeRedaction = true'
+        );
+        assert.strictEqual(
+          attCheck.removedAttachmentsWithUninspectedContent.length,
+          2,
+          'Must list both removed attachments whose contents were uninspected prior to removal'
+        );
+        for (const remAtt of attCheck.removedAttachmentsWithUninspectedContent) {
+          assert.strictEqual(remAtt.contentInspectedBeforeRedaction, false);
+          assert.strictEqual(remAtt.removedFromExportedPdf, true);
+          assert.strictEqual(remAtt.status, 'REMOVED_FROM_EXPORT_PRIOR_CONTENT_UNINSPECTED');
+        }
+        assert.ok(
+          attCheck.uninspectedPriorContentNotice &&
+            attCheck.uninspectedPriorContentNotice.includes('not inspected prior to redaction'),
+          'Must include explicit uninspectedPriorContentNotice'
+        );
+        assert.strictEqual(
+          verBody.structuralVerification.warnings.some(
+            (w) => w.code === 'PRIOR_UNINSPECTED_ATTACHMENT_REMOVED'
+          ),
+          true,
+          'Must emit PRIOR_UNINSPECTED_ATTACHMENT_REMOVED notice in structuralVerification.warnings'
+        );
+      },
+    },
+    {
+      name: '[P2.3 Test C] AcroForm Fields and Annotations (Widget, FreeText, Stamp, Redact, Caret) Removed and Verified After Redaction',
+      fn: async () => {
+        const pdfDoc = await PDFDocument.create();
+        const font = await pdfDoc.embedFont(StandardFonts.Helvetica);
+        const page = pdfDoc.addPage([595.28, 841.89]);
+        page.drawText('Form and Annotation Structural Verification Test', {
+          x: 50,
+          y: 780,
+          size: 13,
+          font,
+        });
+
+        // 1. AcroForm Text Widget containing synthetic PAN
+        const form = pdfDoc.getForm();
+        const panField = form.createTextField('applicant.pan');
+        panField.setText('ABCDE1234F');
+        panField.addToPage(page, { x: 60, y: 700, width: 200, height: 26 });
+
+        // 2. Stamp, Redact, Caret, and Link annotations (without unlocatable PII text so automatic redaction succeeds)
+        for (const [idx, subtype] of ['Stamp', 'Redact', 'Caret'].entries()) {
+          const annot = pdfDoc.context.obj({
+            Type: 'Annot',
+            Subtype: subtype,
+            Rect: [60 + idx * 80, 620, 120 + idx * 80, 650],
+          });
+          page.node.addAnnot(pdfDoc.context.register(annot));
+        }
+
+        const linkAnnot = pdfDoc.context.obj({
+          Type: 'Annot',
+          Subtype: 'Link',
+          Rect: [60, 560, 240, 585],
+          A: pdfDoc.context.obj({
+            Type: 'Action',
+            S: 'URI',
+            URI: PDFString.of('https://example.edu/portal'),
+          }),
+        });
+        page.node.addAnnot(pdfDoc.context.register(linkAnnot));
+
+        const pdfBuffer = Buffer.from(await pdfDoc.save());
+        const up = await uploadCustomPdfBuffer(pdfBuffer, 'p23_annotations_forms_test.pdf');
+        assert.strictEqual(up.status, 201);
+        const docId = up.body.documentId;
+
+        const detRes = await fetch(`${baseUrl}/api/detect`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ documentId: docId }),
+        });
+        const detBody = await detRes.json();
+        assert.strictEqual(detRes.status, 200);
+        assert.strictEqual(detBody.totalDetected, 1, 'Must detect PAN inside AcroForm widget');
+
+        const redRes = await fetch(`${baseUrl}/api/redact`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ documentId: docId, mode: 'automatic' }),
+        });
+        assert.strictEqual(redRes.status, 200);
+
+        const verRes = await fetch(`${baseUrl}/api/verify`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ documentId: docId, runOcrCheck: true }),
+        });
+        const verBody = await verRes.json();
+        assert.strictEqual(verRes.status, 200);
+        assert.strictEqual(verBody.verified, true);
+
+        const annCheck = verBody.structuralVerification.checks.annotationsAndForms;
+        assert.strictEqual(annCheck.status, 'PASSED');
+        assert.strictEqual(annCheck.verified, true);
+        assert.strictEqual(annCheck.remainingAnnotationCount, 0, '0 annotations may remain in exported PDF');
+        assert.strictEqual(annCheck.acroFormFieldCount, 0, '0 AcroForm fields may remain in exported PDF');
+        assert.strictEqual(annCheck.hasAcroFormCatalogEntry, false, 'Catalog /AcroForm must be absent');
+        assert.strictEqual(annCheck.hasWidgetAnnotations, false, 'Widget annotations must be absent');
+      },
+    },
+    {
+      name: '[P2.3 Test D] Incremental Revisions Containing Earlier Sensitive Text Removed and Verified After Redaction',
+      fn: async () => {
+        // Revision 1: PDF page contains earlier synthetic PAN ABCDE1234F
+        const pdfDoc = await PDFDocument.create();
+        const font = await pdfDoc.embedFont(StandardFonts.Helvetica);
+        const page = pdfDoc.addPage([595.28, 841.89]);
+        page.drawText('Earlier revision secret PAN: ABCDE1234F', { x: 50, y: 700, size: 12, font });
+
+        const rev1Bytes = Buffer.from(await pdfDoc.save({ useObjectStreams: false }));
+        const rev1Str = rev1Bytes.toString('latin1');
+        const startxrefMatch = /startxref\s+(\d+)/.exec(rev1Str);
+        const rev1XrefOffset = Number(startxrefMatch[1]);
+        const fontNameMatch = /\/(Helvetica-[0-9]+)\s+4\s+0\s+R/.exec(rev1Str);
+        const fontKey = fontNameMatch ? fontNameMatch[1] : 'F1';
+
+        // Revision 2 (Incremental Update): Overwrite page content stream with clean public text
+        const newStreamContent = `BT /${fontKey} 12 Tf 50 700 Td (Current revision public text only) Tj ET`;
+        const obj6Offset = rev1Bytes.length + 1;
+        const obj6Block = `\n6 0 obj\n<</Length ${newStreamContent.length}>>\nstream\n${newStreamContent}\nendstream\nendobj\n`;
+        const rev2XrefOffset = rev1Bytes.length + Buffer.byteLength(obj6Block, 'latin1');
+        const pad10 = String(obj6Offset).padStart(10, '0');
+        const incrementalTail =
+          `xref\n0 1\n0000000000 65535 f \n6 1\n${pad10} 00000 n \n` +
+          `trailer\n<</Size 7/Root 2 0 R/Info 3 0 R/Prev ${rev1XrefOffset}>>\n` +
+          `startxref\n${rev2XrefOffset}\n%%EOF\n`;
+
+        const incrementalPdfBuf = Buffer.concat([
+          rev1Bytes,
+          Buffer.from(obj6Block + incrementalTail, 'latin1'),
+        ]);
+
+        const up = await uploadCustomPdfBuffer(incrementalPdfBuf, 'p23_incremental_revision_test.pdf');
+        assert.strictEqual(up.status, 201);
+        const docId = up.body.documentId;
+
+        const detRes = await fetch(`${baseUrl}/api/detect`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ documentId: docId }),
+        });
+        const detBody = await detRes.json();
+        assert.strictEqual(detRes.status, 200);
+        assert.strictEqual(detBody.structuralAudit.revisions.status, 'DETECTED');
+        assert.strictEqual(detBody.structuralAudit.revisions.revisionCount, 2);
+
+        const redRes = await fetch(`${baseUrl}/api/redact`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ documentId: docId, mode: 'automatic' }),
+        });
+        assert.strictEqual(redRes.status, 200);
+
+        const verRes = await fetch(`${baseUrl}/api/verify`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ documentId: docId, runOcrCheck: true }),
+        });
+        const verBody = await verRes.json();
+        assert.strictEqual(verRes.status, 200);
+        assert.strictEqual(verBody.verified, true);
+        assert.strictEqual(verBody.structuralVerification.status, 'PASSED');
+
+        const revCheck = verBody.structuralVerification.checks.revisions;
+        assert.strictEqual(revCheck.status, 'PASSED');
+        assert.strictEqual(revCheck.verified, true);
+        assert.strictEqual(revCheck.incrementalUpdatesDetected, false);
+        assert.strictEqual(revCheck.revisionCount, 1);
+        assert.strictEqual(revCheck.prevCount, 0);
+        assert.strictEqual(revCheck.startxrefCount, 1);
+        assert.strictEqual(revCheck.xrefSectionCount, 1);
+      },
+    },
+    {
+      name: '[P2.3 Test E] Text-Layer Removal Verification & Fail-Safe Negative Checks (FAILED and INDETERMINATE Block Overall Verification)',
+      fn: async () => {
+        // 1. Verify that a normal DocShield redacted export has 0 selectable text items and 0 PDF text operators
+        const pdfDoc = await PDFDocument.create();
+        const font = await pdfDoc.embedFont(StandardFonts.Helvetica);
+        const page = pdfDoc.addPage([595.28, 841.89]);
+        page.drawText('Selectable Text Before Redaction: PAN ABCDE1234F', {
+          x: 50,
+          y: 720,
+          size: 12,
+          font,
+        });
+        const origBuf = Buffer.from(await pdfDoc.save());
+
+        const up = await uploadCustomPdfBuffer(origBuf, 'p23_text_layer_test.pdf');
+        assert.strictEqual(up.status, 201);
+        const docId = up.body.documentId;
+
+        await fetch(`${baseUrl}/api/detect`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ documentId: docId }),
+        });
+        await fetch(`${baseUrl}/api/redact`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ documentId: docId, mode: 'automatic' }),
+        });
+
+        const verRes = await fetch(`${baseUrl}/api/verify`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ documentId: docId, runOcrCheck: true }),
+        });
+        const verBody = await verRes.json();
+        assert.strictEqual(verRes.status, 200);
+
+        const txtCheck = verBody.structuralVerification.checks.textLayer;
+        assert.strictEqual(txtCheck.status, 'PASSED');
+        assert.strictEqual(txtCheck.verified, true);
+        assert.strictEqual(txtCheck.selectableTextItemCount, 0);
+        assert.strictEqual(txtCheck.selectableCharacterCount, 0);
+        assert.strictEqual(txtCheck.pageTextOperatorCount, 0);
+        assert.strictEqual(txtCheck.rawStreamTextBlockCount, 0);
+
+        // 2. Negative Verification Check: If an exported PDF still contains a selectable text layer,
+        //    non-allowlisted metadata, and an AcroForm widget, structuralVerification MUST return FAILED
+        //    and overall verification.verified MUST be false.
+        const rec = getDocumentRecord(docId);
+        const unsanitizedDoc = await PDFDocument.create();
+        const unsanitizedFont = await unsanitizedDoc.embedFont(StandardFonts.Helvetica);
+        const unsanitizedPage = unsanitizedDoc.addPage([500, 500]);
+        unsanitizedPage.drawText('Surviving selectable text object', {
+          x: 50,
+          y: 400,
+          size: 12,
+          font: unsanitizedFont,
+        });
+        unsanitizedDoc.setAuthor('Leaked Author Name');
+        const unsanitizedForm = unsanitizedDoc.getForm();
+        const leakedWidget = unsanitizedForm.createTextField('leaked.field');
+        leakedWidget.setText('surviving widget');
+        leakedWidget.addToPage(unsanitizedPage, { x: 50, y: 300, width: 150, height: 24 });
+
+        const tempUnsanitizedPath = `${rec.redactedFilePath}.unsanitized_test.pdf`;
+        createdSampleFiles.add(tempUnsanitizedPath);
+        await fs.promises.writeFile(tempUnsanitizedPath, Buffer.from(await unsanitizedDoc.save()));
+
+        const failedVerResult = await verifyRedactedPdf(tempUnsanitizedPath, [], [], false, null);
+        assert.strictEqual(
+          failedVerResult.ocrVerification.status,
+          'PASSED',
+          'Even when 0 selected items fail OCR, structural failure must block overall pass'
+        );
+        assert.strictEqual(failedVerResult.structuralVerification.status, 'FAILED');
+        assert.strictEqual(failedVerResult.structuralVerification.verified, false);
+        assert.strictEqual(failedVerResult.structuralVerification.checks.metadata.status, 'FAILED');
+        assert.strictEqual(
+          failedVerResult.structuralVerification.checks.annotationsAndForms.status,
+          'FAILED'
+        );
+        assert.strictEqual(failedVerResult.structuralVerification.checks.textLayer.status, 'FAILED');
+        assert.strictEqual(
+          failedVerResult.verified,
+          false,
+          'Overall verification.verified MUST be false when any structural check fails'
+        );
+        assert.strictEqual(failedVerResult.status, 'FAILED');
+
+        // 3. Fail-Safe Indeterminate Check: Unexpected inspection errors must NEVER be treated as PASSED
+        const indetResult = await verifyRedactedPdf(
+          rec.redactedFilePath,
+          [],
+          [],
+          false,
+          null,
+          {
+            simulateCheckErrors: {
+              attachments: 'Simulated attachment parser error',
+            },
+          }
+        );
+        assert.strictEqual(indetResult.structuralVerification.checks.attachments.status, 'INDETERMINATE');
+        assert.strictEqual(indetResult.structuralVerification.status, 'INDETERMINATE');
+        assert.strictEqual(indetResult.structuralVerification.verified, false);
+        assert.strictEqual(
+          indetResult.verified,
+          false,
+          'Overall verification.verified MUST be false when any structural check is INDETERMINATE'
+        );
+        assert.strictEqual(indetResult.status, 'INDETERMINATE');
+      },
+    },
+    {
+      name: '[P2.3 Test F] Clean PDF Passing All OCR and Structural Verification Checks End-to-End',
+      fn: async () => {
+        const up = await uploadSampleFile('clean-doc');
+        assert.strictEqual(up.status, 201);
+        const docId = up.body.documentId;
+
+        const detRes = await fetch(`${baseUrl}/api/detect`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ documentId: docId }),
+        });
+        const detBody = await detRes.json();
+        assert.strictEqual(detRes.status, 200);
+        assert.strictEqual(detBody.totalDetected, 0);
+
+        const redRes = await fetch(`${baseUrl}/api/redact`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ documentId: docId, mode: 'automatic' }),
+        });
+        assert.strictEqual(redRes.status, 200);
+
+        const verRes = await fetch(`${baseUrl}/api/verify`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ documentId: docId, runOcrCheck: true }),
+        });
+        const verBody = await verRes.json();
+        assert.strictEqual(verRes.status, 200);
+
+        assert.strictEqual(verBody.verified, true);
+        assert.strictEqual(verBody.status, 'PASSED');
+        assert.strictEqual(verBody.ocrVerification.status, 'PASSED');
+        assert.strictEqual(verBody.ocrVerification.verified, true);
+        assert.strictEqual(verBody.structuralVerification.status, 'PASSED');
+        assert.strictEqual(verBody.structuralVerification.verified, true);
+
+        for (const checkKey of [
+          'metadata',
+          'attachments',
+          'annotationsAndForms',
+          'revisions',
+          'textLayer',
+        ]) {
+          assert.strictEqual(
+            verBody.structuralVerification.checks[checkKey].status,
+            'PASSED',
+            `Expected structural check "${checkKey}" to be PASSED`
+          );
+        }
+
+        // Verify GET /api/report/:id includes both ocrVerification and structuralVerification separately
+        const repRes = await fetch(`${baseUrl}/api/report/${verBody.reportId}`);
+        const repBody = await repRes.json();
+        assert.strictEqual(repRes.status, 200);
+        assert.strictEqual(repBody.report.verified, true);
+        assert.strictEqual(repBody.report.verificationStatus, 'PASSED');
+        assert.strictEqual(repBody.report.ocrVerification.status, 'PASSED');
+        assert.strictEqual(repBody.report.structuralVerification.status, 'PASSED');
+        assert.strictEqual(repBody.report.verificationDetails.ocrVerification.status, 'PASSED');
+        assert.strictEqual(repBody.report.verificationDetails.structuralVerification.status, 'PASSED');
       },
     },
   ];

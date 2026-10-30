@@ -342,11 +342,15 @@ export async function verifyPdfController(req, res, next) {
       });
     }
 
+    const originalStructuralAudit =
+      docRecord.structuralAudit || docRecord.extraction?.structuralAudit || null;
+
     const verificationResult = await verifyRedactedPdf(
       docRecord.redactedFilePath,
       docRecord.detectedItems || [],
       docRecord.selectedItemIds || [],
-      runOcrCheck
+      runOcrCheck,
+      originalStructuralAudit
     );
 
     const report = buildPrivacyAssessmentReport({
@@ -364,6 +368,10 @@ export async function verifyPdfController(req, res, next) {
       success: true,
       documentId,
       reportId: report.reportId,
+      verified: verificationResult.verified,
+      status: verificationResult.status,
+      ocrVerification: verificationResult.ocrVerification,
+      structuralVerification: verificationResult.structuralVerification,
       verification: verificationResult,
       report,
     });
