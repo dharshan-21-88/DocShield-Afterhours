@@ -1028,6 +1028,432 @@ async function runTests() {
         assert.strictEqual(verBody.verification.selectedStillDetectableCount, 0);
       },
     },
+
+    // =========================================================================
+    // MANUAL SWAGGER TESTING BUG-FIX REGRESSION TESTS (Bugs 1 through 5)
+    // =========================================================================
+    {
+      name: '[Bug 1A] Valid Indian PAN Identifier (ABCDE1234F) Classified as NATIONAL_ID_PAN (Not Aadhaar)',
+      fn: async () => {
+        const up = await uploadSampleFile('multi-category');
+        assert.strictEqual(up.status, 201);
+        const docId = up.body.documentId;
+
+        const detRes = await fetch(`${baseUrl}/api/detect`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ documentId: docId }),
+        });
+        const detBody = await detRes.json();
+        assert.strictEqual(detRes.status, 200);
+
+        const panItem = detBody.items.find((i) => i.text === 'ABCDE1234F');
+        assert.ok(panItem, 'Must detect PAN identifier ABCDE1234F');
+        assert.strictEqual(
+          panItem.category,
+          'NATIONAL_ID_PAN',
+          `Expected ABCDE1234F category to be NATIONAL_ID_PAN, got ${panItem.category}`
+        );
+        assert.strictEqual(panItem.categoryLabel, 'Permanent Account Number (PAN)');
+        assert.ok(
+          panItem.detectionStatus.includes('Permanent Account Number (PAN)'),
+          `Expected PAN detectionStatus explanation, got "${panItem.detectionStatus}"`
+        );
+        assert.strictEqual(
+          detBody.items.some((i) => i.text === 'ABCDE1234F' && i.category === 'NATIONAL_ID_AADHAAR'),
+          false,
+          'ABCDE1234F must never be classified as NATIONAL_ID_AADHAAR'
+        );
+      },
+    },
+    {
+      name: '[Bug 1B] Aadhaar Detection Continues Working Accurately alongside PAN',
+      fn: async () => {
+        const up = await uploadSampleFile('multi-category');
+        assert.strictEqual(up.status, 201);
+        const docId = up.body.documentId;
+
+        const detRes = await fetch(`${baseUrl}/api/detect`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ documentId: docId }),
+        });
+        const detBody = await detRes.json();
+        assert.strictEqual(detRes.status, 200);
+
+        const aadhaarItem = detBody.items.find((i) => i.text === '6291 8402 5519');
+        assert.ok(aadhaarItem, 'Must detect 12-digit Aadhaar identifier 6291 8402 5519');
+        assert.strictEqual(aadhaarItem.category, 'NATIONAL_ID_AADHAAR');
+        assert.strictEqual(aadhaarItem.categoryLabel, 'Aadhaar / National ID Number');
+        assert.ok(aadhaarItem.boundingBox, 'Aadhaar item must have a valid boundingBox');
+      },
+    },
+    {
+      name: '[Bug 2A] 16-Digit Card Number (4532 8910 2234 9012) Does Not Create Misleading Nested Aadhaar Detection',
+      fn: async () => {
+        const up = await uploadSampleFile('multi-category');
+        assert.strictEqual(up.status, 201);
+        const docId = up.body.documentId;
+
+        const detRes = await fetch(`${baseUrl}/api/detect`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ documentId: docId }),
+        });
+        const detBody = await detRes.json();
+        assert.strictEqual(detRes.status, 200);
+
+        const cardItems = detBody.items.filter((i) => i.text === '4532 8910 2234 9012');
+        assert.strictEqual(cardItems.length, 1, '16-digit card number must be detected once');
+        assert.strictEqual(cardItems[0].category, 'FINANCIAL_ACCOUNT');
+        assert.ok(cardItems[0].boundingBox, '16-digit card number must have a valid boundingBox');
+
+        // Ensure neither the first 12 digits ("4532 8910 2234") nor the last 12 digits ("8910 2234 9012")
+        // are emitted as nested/overlapping NATIONAL_ID_AADHAAR detections
+        const nestedAadhaar = detBody.items.filter(
+          (i) => i.text === '4532 8910 2234' || i.text === '8910 2234 9012'
+        );
+        assert.strictEqual(
+          nestedAadhaar.length,
+          0,
+          `Expected 0 nested Aadhaar detections inside 16-digit card number, got: ${JSON.stringify(nestedAadhaar)}`
+        );
+      },
+    },
+    {
+      name: '[Bug 2B] Genuine Nearby Independent Detections on the Same Line Are Preserved',
+      fn: async () => {
+        const pdfDoc = await PDFDocument.create();
+        const page = pdfDoc.addPage([595.28, 841.89]);
+        const font = await pdfDoc.embedFont(StandardFonts.Helvetica);
+        page.drawText('FICTIONAL INLINE MULTI-FIELD RECORD', { x: 50, y: 760, size: 14, font });
+        // Place PAN, Aadhaar, and Phone adjacent on the very same line
+        page.drawText('KYC Summary: PAN ABCDE1234F | Aadhaar 4829 7301 9482 | Mobile +91-9876543210', {
+          x: 50,
+          y: 710,
+          size: 11,
+          font,
+        });
+        const buf = Buffer.from(await pdfDoc.save());
+
+        const up = await uploadCustomPdfBuffer(buf, 'nearby_same_line.pdf');
+        assert.strictEqual(up.status, 201);
+
+        const detRes = await fetch(`${baseUrl}/api/detect`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ documentId: up.body.documentId }),
+        });
+        const detBody = await detRes.json();
+        assert.strictEqual(detRes.status, 200);
+        assert.strictEqual(detBody.totalDetected, 3, 'All 3 nearby independent items on the same line must be preserved');
+
+        const categories = detBody.items.map((i) => i.category).sort();
+        assert.deepStrictEqual(categories, ['NATIONAL_ID_AADHAAR', 'NATIONAL_ID_PAN', 'PHONE_NUMBER']);
+        for (const item of detBody.items) {
+          assert.ok(item.boundingBox, `Nearby item ${item.text} must have a valid boundingBox`);
+        }
+      },
+    },
+    {
+      name: '[Bug 3A] Multi-Category Sample Has Valid Bounding Boxes for Every Item & Automatic Redaction Succeeds',
+      fn: async () => {
+        const up = await uploadSampleFile('multi-category');
+        assert.strictEqual(up.status, 201);
+        const docId = up.body.documentId;
+
+        const detRes = await fetch(`${baseUrl}/api/detect`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ documentId: docId }),
+        });
+        const detBody = await detRes.json();
+        assert.strictEqual(detRes.status, 200);
+        assert.strictEqual(detBody.totalDetected, 9);
+
+        // Verify zero items have boundingBox: null
+        const nullBoxItems = detBody.items.filter((i) => !i.boundingBox);
+        assert.strictEqual(
+          nullBoxItems.length,
+          0,
+          `Expected all detected items in multi-category PDF to have valid bounding boxes, but found null on: ${JSON.stringify(nullBoxItems)}`
+        );
+
+        // Automatic redaction on multi-category PDF must now succeed (HTTP 200) and verify cleanly
+        const redRes = await fetch(`${baseUrl}/api/redact`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ documentId: docId, mode: 'automatic' }),
+        });
+        const redBody = await redRes.json();
+        assert.strictEqual(redRes.status, 200, `Expected automatic redaction on multi-category to return 200, got ${redRes.status}: ${JSON.stringify(redBody)}`);
+        assert.strictEqual(redBody.selectedForRedactionCount, 9);
+
+        const verRes = await fetch(`${baseUrl}/api/verify`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ documentId: docId, runOcrCheck: true }),
+        });
+        const verBody = await verRes.json();
+        assert.strictEqual(verRes.status, 200);
+        assert.strictEqual(verBody.verification.selectedStillDetectableCount, 0);
+      },
+    },
+    {
+      name: '[Bug 3B] Text Spans Split Across Multiple PDF Runs / Font Variations / Line Breaks Map to Valid Coordinates',
+      fn: async () => {
+        const pdfDoc = await PDFDocument.create();
+        const page = pdfDoc.addPage([595.28, 841.89]);
+        const fontRegular = await pdfDoc.embedFont(StandardFonts.Helvetica);
+        const fontBold = await pdfDoc.embedFont(StandardFonts.HelveticaBold);
+
+        page.drawText('SPLIT SPAN & WHITESPACE COORDINATE TEST (FICTIONAL)', {
+          x: 50,
+          y: 760,
+          size: 14,
+          font: fontBold,
+        });
+
+        // Draw a 16-digit card number split across 4 separate drawText calls (producing 4 separate PDF text runs)
+        page.drawText('Card Number:', { x: 50, y: 700, size: 12, font: fontRegular });
+        page.drawText('4532', { x: 135, y: 700, size: 12, font: fontBold });
+        page.drawText('8910', { x: 170, y: 700, size: 12, font: fontRegular });
+        page.drawText('2234', { x: 205, y: 700, size: 12, font: fontBold });
+        page.drawText('9012', { x: 240, y: 700, size: 12, font: fontRegular });
+
+        // Draw an address wrapped across 2 separate lines
+        page.drawText('No. 88, Residency Road,', { x: 50, y: 650, size: 12, font: fontRegular });
+        page.drawText('Bengaluru - 560025', { x: 50, y: 630, size: 12, font: fontRegular });
+
+        const buf = Buffer.from(await pdfDoc.save());
+        const up = await uploadCustomPdfBuffer(buf, 'split_runs_and_wraps.pdf');
+        assert.strictEqual(up.status, 201);
+        const docId = up.body.documentId;
+
+        const detRes = await fetch(`${baseUrl}/api/detect`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ documentId: docId }),
+        });
+        const detBody = await detRes.json();
+        assert.strictEqual(detRes.status, 200);
+
+        const cardItem = detBody.items.find((i) => i.category === 'FINANCIAL_ACCOUNT');
+        const addrItem = detBody.items.find((i) => i.category === 'ADDRESS');
+        assert.ok(cardItem && cardItem.boundingBox, 'Card split across 4 PDF text runs must map to a valid boundingBox');
+        assert.ok(addrItem && addrItem.boundingBox, 'Wrapped 2-line PDF text address must map to a valid boundingBox');
+        assert.ok(
+          Array.isArray(addrItem.boundingBoxes) && addrItem.boundingBoxes.length === 2,
+          'Wrapped 2-line PDF text address must include 2 per-line boundingBoxes'
+        );
+
+        const redRes = await fetch(`${baseUrl}/api/redact`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ documentId: docId, mode: 'automatic' }),
+        });
+        assert.strictEqual(redRes.status, 200);
+      },
+    },
+    {
+      name: '[Bug 4A] Automatic Redaction Never Silently Skips Unlocatable Items & Fails Safely with Structured Error',
+      fn: async () => {
+        const up = await uploadSampleFile('marks-card');
+        assert.strictEqual(up.status, 201);
+        const docId = up.body.documentId;
+
+        const detRes = await fetch(`${baseUrl}/api/detect`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ documentId: docId }),
+        });
+        assert.strictEqual(detRes.status, 200);
+
+        // Simulate a synthetic unlocatable detection in the stored document record whose text does not exist on the page
+        const rec = getDocumentRecord(docId);
+        rec.detectedItems.push({
+          id: 'det_unlocatable_99',
+          text: 'SYNTHETIC-UNLOCATABLE-TOKEN-9999',
+          category: 'NATIONAL_ID_PAN',
+          categoryLabel: 'Permanent Account Number (PAN)',
+          confidence: 'LOW_UNCERTAIN',
+          detectionStatus: 'Synthetic unlocatable item for fail-safe redaction test',
+          pageNumber: 1,
+          boundingBox: null,
+        });
+
+        // Automatic redaction MUST refuse to silently skip det_unlocatable_99 and return 422 with structured details
+        const autoRedRes = await fetch(`${baseUrl}/api/redact`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ documentId: docId, mode: 'automatic' }),
+        });
+        const autoRedBody = await autoRedRes.json();
+        assert.strictEqual(autoRedRes.status, 422, 'Automatic redaction with unlocatable item must return HTTP 422');
+        assert.strictEqual(autoRedBody.success, false);
+        assert.strictEqual(autoRedBody.error, 'REDACTION_COORDINATES_MISSING');
+        assert.ok(autoRedBody.details, 'Error response must include structured details object');
+        assert.strictEqual(autoRedBody.details.unlocatableCount, 1);
+        assert.strictEqual(autoRedBody.details.unlocatableItems[0].id, 'det_unlocatable_99');
+        assert.strictEqual(
+          rec.redactedFilePath,
+          null,
+          'Document record must not point to a partially modified redacted file when redaction aborts'
+        );
+      },
+    },
+    {
+      name: '[Bug 4B] Coordinate Recovery Resolves Cleared Coordinates & Selective Redaction Works for Locatable Items',
+      fn: async () => {
+        const up = await uploadSampleFile('marks-card');
+        assert.strictEqual(up.status, 201);
+        const docId = up.body.documentId;
+
+        const detRes = await fetch(`${baseUrl}/api/detect`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ documentId: docId }),
+        });
+        const detBody = await detRes.json();
+        assert.strictEqual(detRes.status, 200);
+
+        // 1. If a real item on the page had its cached boundingBox cleared to null, redactPdfController
+        //    re-runs coordinate resolution before redaction and succeeds safely:
+        const rec = getDocumentRecord(docId);
+        rec.detectedItems[0].boundingBox = null;
+        delete rec.detectedItems[0].boundingBoxes;
+
+        const recoveredRedRes = await fetch(`${baseUrl}/api/redact`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ documentId: docId, mode: 'automatic' }),
+        });
+        assert.strictEqual(recoveredRedRes.status, 200, 'Automatic redaction should recover coordinates for real page text');
+        const firstRedactedSha = (await recoveredRedRes.json()).redactedPdfSha256;
+        const recAfterFirstRedact = getDocumentRecord(docId);
+        const firstRedactedPath = recAfterFirstRedact.redactedFilePath;
+        assert.strictEqual(Boolean(firstRedactedPath && fs.existsSync(firstRedactedPath)), true);
+
+        // 2. If an unlocatable item is added and automatic redaction fails (422), the previously generated
+        //    valid redacted file on disk MUST NOT be deleted or corrupted:
+        recAfterFirstRedact.detectedItems.push({
+          id: 'det_unlocatable_100',
+          text: 'NON-EXISTENT-TEXT-ON-PAGE-0000',
+          category: 'FINANCIAL_ACCOUNT',
+          categoryLabel: 'Financial Account / Banking Identifier',
+          confidence: 'LOW_UNCERTAIN',
+          detectionStatus: 'Unlocatable item',
+          pageNumber: 1,
+          boundingBox: null,
+        });
+
+        const failRedRes = await fetch(`${baseUrl}/api/redact`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ documentId: docId, mode: 'automatic' }),
+        });
+        assert.strictEqual(failRedRes.status, 422);
+        const recAfterFailedRedact = getDocumentRecord(docId);
+        assert.strictEqual(
+          fs.existsSync(firstRedactedPath),
+          true,
+          'Previous valid redacted PDF must remain intact when a subsequent redaction attempt fails pre-validation'
+        );
+        assert.strictEqual(recAfterFailedRedact.redactedSha256, firstRedactedSha);
+
+        // 3. Selective redaction of the locatable items succeeds cleanly:
+        const locatableIds = detBody.items.slice(0, 3).map((i) => i.id);
+        const selRedRes = await fetch(`${baseUrl}/api/redact`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            documentId: docId,
+            mode: 'selective',
+            selectedItemIds: locatableIds,
+          }),
+        });
+        assert.strictEqual(selRedRes.status, 200, 'Selective redaction of locatable items must succeed');
+      },
+    },
+    {
+      name: '[Bug 5] Verification IDs (ver_det_*) & Report References Never Collide with Original Detection IDs (det_*)',
+      fn: async () => {
+        const up = await uploadSampleFile('marks-card');
+        assert.strictEqual(up.status, 201);
+        const docId = up.body.documentId;
+
+        const detRes = await fetch(`${baseUrl}/api/detect`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ documentId: docId }),
+        });
+        const detBody = await detRes.json();
+        assert.strictEqual(detRes.status, 200);
+        assert.ok(detBody.items.length >= 4);
+
+        // Select only the first 2 items (det_1, det_2) for selective redaction, leaving det_3+ unselected
+        const selectedIds = [detBody.items[0].id, detBody.items[1].id];
+        const unselectedOriginalIds = detBody.items.slice(2).map((i) => i.id);
+
+        const redRes = await fetch(`${baseUrl}/api/redact`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            documentId: docId,
+            mode: 'selective',
+            selectedItemIds: selectedIds,
+          }),
+        });
+        assert.strictEqual(redRes.status, 200);
+
+        const verRes = await fetch(`${baseUrl}/api/verify`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ documentId: docId, runOcrCheck: true }),
+        });
+        const verBody = await verRes.json();
+        assert.strictEqual(verRes.status, 200);
+
+        const removedIds = new Set(verBody.verification.removedItems.map((i) => i.id));
+        const remainingItems = verBody.verification.remainingItems;
+        assert.strictEqual(removedIds.size, 2);
+        assert.ok(remainingItems.length >= 1, 'Unselected items must be reported in remainingItems');
+
+        for (const rem of remainingItems) {
+          assert.ok(
+            rem.id.startsWith('ver_det_'),
+            `Remaining item ID "${rem.id}" must use "ver_det_" namespace to avoid colliding with original "det_" IDs`
+          );
+          assert.strictEqual(
+            removedIds.has(rem.id),
+            false,
+            `Remaining item ID "${rem.id}" must never collide with a removed item ID`
+          );
+          if (rem.originalDetectionId) {
+            assert.strictEqual(
+              removedIds.has(rem.originalDetectionId),
+              false,
+              `originalDetectionId "${rem.originalDetectionId}" must reference an unselected item, not a removed item`
+            );
+            assert.ok(
+              unselectedOriginalIds.includes(rem.originalDetectionId),
+              `originalDetectionId "${rem.originalDetectionId}" must match one of the unselected original IDs`
+            );
+          }
+        }
+
+        // Also check the Privacy Assessment Report
+        const rep = verBody.report;
+        const repRemovedIds = new Set(rep.removedSensitiveItems.map((i) => i.id));
+        for (const rem of rep.remainingSensitiveItems) {
+          assert.strictEqual(
+            repRemovedIds.has(rem.id),
+            false,
+            'Report remainingSensitiveItems IDs must never overlap with removedSensitiveItems IDs'
+          );
+        }
+      },
+    },
   ];
 
   const results = testDefinitions.map((t) => ({

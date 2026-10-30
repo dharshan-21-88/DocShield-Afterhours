@@ -19,6 +19,7 @@ export const SENSITIVE_CATEGORIES = {
   ADDRESS: 'Physical Address',
   STUDENT_REG_NUMBER: 'Student Registration Number',
   NATIONAL_ID_AADHAAR: 'Aadhaar / National ID Number',
+  NATIONAL_ID_PAN: 'Permanent Account Number (PAN)',
   FINANCIAL_ACCOUNT: 'Financial Account / Banking Identifier',
 };
 
@@ -28,6 +29,8 @@ const DETECTION_PATTERNS = [
     label: SENSITIVE_CATEGORIES.EMAIL_ADDRESS,
     regex: /\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}\b/g,
     confidence: 'HIGH',
+    specificity: 95,
+    contextKeywords: ['email', 'e-mail', 'mail', 'contact'],
     statusNote: 'Matched standard RFC email address pattern',
   },
   {
@@ -36,14 +39,38 @@ const DETECTION_PATTERNS = [
     // Matches e.g. REG-2026-CS-0492, USN: 1RV22CS084, STU20240918, Roll No: CS21B1045
     regex: /\b(?:REG-\d{4}-[A-Z]{2,4}-\d{3,6}|1[A-Z]{2}\d{2}[A-Z]{2}\d{3}|STU[-/]?\d{4}[-/]?\d{3,6}|[A-Z]{2}\d{2}[A-Z]\d{4})\b/g,
     confidence: 'HIGH',
+    specificity: 92,
+    contextKeywords: ['registration', 'reg', 'usn', 'roll', 'student', 'enrollment'],
     statusNote: 'Matched academic student registration / university roll number format',
+  },
+  {
+    category: 'NATIONAL_ID_PAN',
+    label: SENSITIVE_CATEGORIES.NATIONAL_ID_PAN,
+    // Matches Indian Income Tax Permanent Account Number (5 uppercase letters + 4 digits + 1 uppercase check letter)
+    regex: /\b[A-Z]{5}\d{4}[A-Z]\b/g,
+    confidence: 'HIGH',
+    specificity: 94,
+    contextKeywords: ['pan', 'tax', 'income tax', 'permanent account'],
+    statusNote: 'Matched 10-character Indian Permanent Account Number (PAN) format',
+  },
+  {
+    category: 'FINANCIAL_ACCOUNT',
+    label: SENSITIVE_CATEGORIES.FINANCIAL_ACCOUNT,
+    // Matches IFSC codes (SBIN0004821), masked/full account numbers with context, or 16-digit payment card numbers
+    regex: /\b(?:[A-Z]{4}0[A-Z0-9]{6}|ACC-\d{4}-\d{6,8}|(?<![\d-])(?:\d{4}[\s-]){3}\d{4}(?![\s-]\d{4}))\b/g,
+    confidence: 'MEDIUM',
+    specificity: 90,
+    contextKeywords: ['card', 'account', 'acc', 'ifsc', 'bank', 'branch', 'disbursement', 'credit', 'debit', 'payment'],
+    statusNote: 'Matched financial account number, IFSC code, or 16-digit payment card pattern',
   },
   {
     category: 'NATIONAL_ID_AADHAAR',
     label: SENSITIVE_CATEGORIES.NATIONAL_ID_AADHAAR,
-    // Matches 12-digit Aadhaar-like (e.g., 4829 7301 9482 or 4829-7301-9482) or PAN-like (ABCDE1234F) or ID-XXXX
-    regex: /\b(?:[2-9]\d{3}[\s-]\d{4}[\s-]\d{4}|[A-Z]{5}\d{4}[A-Z]|ID-\d{4}-\d{4})\b/g,
+    // Matches standalone 12-digit Aadhaar-like (e.g., 4829 7301 9482 or 4829-7301-9482, not part of a 16-digit sequence) or ID-XXXX-XXXX
+    regex: /\b(?:(?<!\d{4}[\s-])(?<![\d-])[2-9]\d{3}[\s-]\d{4}[\s-]\d{4}(?![\s-]\d{4})|ID-\d{4}-\d{4})\b/g,
     confidence: 'HIGH',
+    specificity: 88,
+    contextKeywords: ['aadhaar', 'aadhar', 'uidai', 'national id', 'identity', 'kyc'],
     statusNote: 'Matched 12-digit Aadhaar-like space/hyphen-separated pattern or national ID code',
   },
   {
@@ -52,15 +79,9 @@ const DETECTION_PATTERNS = [
     // Matches Indian/International phone numbers e.g. +91-9876543210, +91 98765 43210, (555) 234-5678, 9876543210
     regex: /(?:\+91[\s-]?)?[6-9]\d{4}[\s-]?\d{5}\b|\+\d{1,3}[\s-]?\(?\d{3}\)?[\s-]?\d{3}[\s-]?\d{4}\b/g,
     confidence: 'MEDIUM',
+    specificity: 80,
+    contextKeywords: ['phone', 'mobile', 'contact', 'tel', 'telephone', 'cell', 'guardian'],
     statusNote: 'Matched 10-digit mobile / telephone number pattern',
-  },
-  {
-    category: 'FINANCIAL_ACCOUNT',
-    label: SENSITIVE_CATEGORIES.FINANCIAL_ACCOUNT,
-    // Matches IFSC codes (SBIN0004821), masked/full account numbers with context or 11-16 digit account/card numbers
-    regex: /\b(?:[A-Z]{4}0[A-Z0-9]{6}|ACC-\d{4}-\d{6,8}|(?:\d{4}[\s-]){3}\d{4})\b/g,
-    confidence: 'MEDIUM',
-    statusNote: 'Matched financial account number, IFSC code, or 16-digit payment card pattern',
   },
   {
     category: 'ADDRESS',
@@ -68,12 +89,70 @@ const DETECTION_PATTERNS = [
     // Matches address phrases like "No. 42, MG Road, Bengaluru - 560001" or "Flat 302, Green Valley Apt, Pune 411001"
     regex: /\b(?:No\.?\s*\d+|Flat\s*#?\d+|Plot\s*#?\d+|\d{1,4}\s+[A-Z][a-z]+\s+(?:Street|St|Road|Rd|Avenue|Ave|Layout|Nagar|Park|Block))[A-Za-z0-9,\s.-]{8,65}?(?:-\s*\d{6}|\b\d{5,6}\b)/gi,
     confidence: 'LOW_UNCERTAIN',
+    specificity: 85,
+    contextKeywords: ['address', 'residence', 'residential', 'permanent', 'street', 'road', 'flat', 'plot'],
     statusNote: 'Heuristic address pattern (street/building + postal PIN code); review carefully as addresses vary widely',
   },
 ];
 
 function cleanToken(str) {
   return (str || '').replace(/^[,.;:()[\]"']+|[,.;:()[\]"']+$/g, '').trim().toLowerCase();
+}
+
+/**
+ * Compute a deterministic score for a candidate detection to resolve overlapping matches
+ * on the same underlying text span using pattern specificity, surrounding label context, and match length.
+ */
+function scoreCandidateMatch(candidate, pageText) {
+  const lookbehindStart = Math.max(0, candidate.start - 48);
+  const precedingContext = pageText.slice(lookbehindStart, candidate.start).toLowerCase();
+  const followingContext = pageText.slice(candidate.end, Math.min(pageText.length, candidate.end + 24)).toLowerCase();
+
+  let contextBonus = 0;
+  for (const kw of candidate.pattern.contextKeywords || []) {
+    if (precedingContext.includes(kw)) {
+      contextBonus += 25;
+      break;
+    }
+    if (followingContext.includes(kw)) {
+      contextBonus += 10;
+      break;
+    }
+  }
+
+  return candidate.length * 10 + (candidate.pattern.specificity || 50) + contextBonus;
+}
+
+/**
+ * Resolve overlapping candidate detections on the same page deterministically:
+ * - Candidates that do not overlap any character indices are always preserved (even if nearby on the same line).
+ * - When two candidates overlap in character span `[start, end)`, the candidate with the higher
+ *   context + specificity + span length score wins.
+ */
+function resolveOverlappingCandidates(candidates, pageText) {
+  const scored = candidates.map((c) => ({
+    ...c,
+    score: scoreCandidateMatch(c, pageText),
+  }));
+
+  // Sort by highest score first, then longest span, then earliest start offset
+  scored.sort((a, b) => {
+    if (b.score !== a.score) return b.score - a.score;
+    if (b.length !== a.length) return b.length - a.length;
+    return a.start - b.start;
+  });
+
+  const accepted = [];
+  for (const cand of scored) {
+    const hasOverlap = accepted.some((acc) => cand.start < acc.end && cand.end > acc.start);
+    if (!hasOverlap) {
+      accepted.push(cand);
+    }
+  }
+
+  // Restore natural document reading order (by start offset)
+  accepted.sort((a, b) => a.start - b.start);
+  return accepted;
 }
 
 /**
@@ -170,17 +249,12 @@ function buildSubBoxInLineElement(el, startCharIdx, subLength, pageWidth) {
 /**
  * Locate the accurate bounding box(es) on the page for a detected text snippet.
  *
- * Addresses Code Review Findings:
- * - L-1: Strategy 1 runs a strict exact token pass (`wNorm === tNorm`) first before considering
- *        a constrained label-prefix fallback pass (`isConstrainedPrefixMatch`), preventing false
- *        substring collisions (e.g., `"4829"` inside `"REF482900"`).
- * - M-1: Tracks consumed word/line element positions in `usedBoxKeys` so duplicate occurrences of
- *        the same email, phone number, or ID on the same page each receive their own distinct bounding box.
- * - H-1: Supports multi-line / wrapped sensitive values (both across contiguous OCR words on consecutive
- *        lines and across consecutive `pdf-text` / `ocr-line` elements), returning per-line `boundingBoxes`
- *        so every wrapped line is masked tightly without drawing a giant box over unrelated text.
- * - H-2: Never anchors blindly to `matchedEls[0]` using a single shared word (like a city name in a header);
- *        requires contiguous token sequence matching or multi-line prefix+suffix line continuity.
+ * Handles:
+ * - Word-level contiguous OCR sequences (exact pass first, then constrained label-prefix pass).
+ * - Single-line substring containment with flexible whitespace normalization (`\s+`) and punctuation-insensitive fallback.
+ * - Multi-element / multi-line spans across up to 6 consecutive PDF text runs or wrapped lines
+ *   (handling split font runs, kerning splits, and line breaks).
+ * - Ordered contiguous sub-token window matching across both OCR words and PDF text elements.
  */
 export function findBoundingBoxForMatch(matchText, page, usedBoxKeys) {
   const normalizedTarget = matchText.replace(/\s+/g, ' ').trim().toLowerCase();
@@ -213,7 +287,7 @@ export function findBoundingBoxForMatch(matchText, page, usedBoxKeys) {
         }
 
         if (allMatch) {
-          const seqKey = `ocr_word_seq_${i}_${targetWords.length}`;
+          const seqKey = `ocr_word_seq_${i}_${targetWords.length}_${normalizedTarget}`;
           if (!usedBoxKeys.has(seqKey)) {
             usedBoxKeys.add(seqKey);
             const seq = ocrWords.slice(i, i + targetWords.length);
@@ -225,7 +299,7 @@ export function findBoundingBoxForMatch(matchText, page, usedBoxKeys) {
   }
 
   // =========================================================================
-  // STRATEGY 2: Single-line and Multi-line Wrapped Containment in Line Elements
+  // STRATEGY 2: Single-line and Multi-Run / Multi-Line Containment in Line Elements
   // (`source === 'pdf-text'` or `source === 'ocr-line'`)
   // =========================================================================
   const lineElements = elements.filter((el) => el.source !== 'ocr');
@@ -243,7 +317,7 @@ export function findBoundingBoxForMatch(matchText, page, usedBoxKeys) {
       const idx = elLower.indexOf(normalizedTarget, searchStart);
       if (idx === -1) break;
 
-      const boxKey = `line_single_${elIdx}_${idx}`;
+      const boxKey = `line_single_${elIdx}_${idx}_${normalizedTarget.length}`;
       if (!usedBoxKeys.has(boxKey)) {
         usedBoxKeys.add(boxKey);
         const subBox = buildSubBoxInLineElement(el, idx, normalizedTarget.length, page.width);
@@ -256,15 +330,18 @@ export function findBoundingBoxForMatch(matchText, page, usedBoxKeys) {
     }
   }
 
-  // Pass 2B: Multi-line wrapped value across 2 or 3 consecutive line elements (Fixes H-1 & H-2)
+  // Pass 2B: Multi-run / Multi-line wrapped value across 2 to 6 consecutive elements
+  // Handles both multi-line wrapped text (e.g., 2-3 line addresses) and single lines split into multiple PDF text runs
+  // due to font changes, kerning, or inline formatting.
   if (candidateLines.length >= 2) {
-    for (const spanCount of [2, 3]) {
+    const maxSpan = Math.min(6, candidateLines.length);
+    for (let spanCount = 2; spanCount <= maxSpan; spanCount++) {
       for (let startIdx = 0; startIdx <= candidateLines.length - spanCount; startIdx++) {
         const spanEls = candidateLines.slice(startIdx, startIdx + spanCount);
         const normTexts = spanEls.map((e) => (e.text || '').replace(/\s+/g, ' ').trim().toLowerCase());
         if (normTexts.some((t) => !t)) continue;
 
-        // Build combined text with single-space join and track each line's [charStart, charEnd]
+        // Build combined text with single-space join and track each element's [charStart, charEnd]
         const ranges = [];
         let combined = '';
         for (let k = 0; k < normTexts.length; k++) {
@@ -274,19 +351,23 @@ export function findBoundingBoxForMatch(matchText, page, usedBoxKeys) {
           ranges.push({ lineIndex: k, start: s, end: combined.length, text: normTexts[k] });
         }
 
-        const matchPos = combined.indexOf(normalizedTarget);
-        if (matchPos !== -1) {
+        let searchPos = 0;
+        while (searchPos < combined.length) {
+          const matchPos = combined.indexOf(normalizedTarget, searchPos);
+          if (matchPos === -1) break;
+          searchPos = matchPos + 1;
+
           const matchEnd = matchPos + normalizedTarget.length;
-          // Ensure the match actually spans across the boundary of the selected lines
+          // Ensure the match actually spans from the first element into the last element of this window
           const touchesFirst = matchPos < ranges[0].end;
           const touchesLast = matchEnd > ranges[ranges.length - 1].start;
           if (!touchesFirst || !touchesLast) continue;
 
-          const spanKey = `line_wrapped_${startIdx}_${spanCount}_${matchPos}`;
+          const spanKey = `line_wrapped_${startIdx}_${spanCount}_${matchPos}_${normalizedTarget.length}`;
           if (usedBoxKeys.has(spanKey)) continue;
           usedBoxKeys.add(spanKey);
 
-          const boundingBoxes = [];
+          const rawSubBoxes = [];
           for (const r of ranges) {
             const overlapStart = Math.max(matchPos, r.start);
             const overlapEnd = Math.min(matchEnd, r.end);
@@ -294,15 +375,34 @@ export function findBoundingBoxForMatch(matchText, page, usedBoxKeys) {
               const localStart = overlapStart - r.start;
               const localLen = overlapEnd - overlapStart;
               const el = spanEls[r.lineIndex];
-              boundingBoxes.push(buildSubBoxInLineElement(el, localStart, localLen, page.width));
+              rawSubBoxes.push(buildSubBoxInLineElement(el, localStart, localLen, page.width));
             }
           }
 
-          if (boundingBoxes.length > 0) {
-            const minX = Math.min(...boundingBoxes.map((b) => b.x));
-            const minY = Math.min(...boundingBoxes.map((b) => b.y));
-            const maxX = Math.max(...boundingBoxes.map((b) => b.x + b.width));
-            const maxY = Math.max(...boundingBoxes.map((b) => b.y + b.height));
+          if (rawSubBoxes.length > 0) {
+            // Merge sub-boxes that lie on the same horizontal line band (within 8pt Y) so split runs on the same
+            // line coalesce into a single clean line box, while multi-line wraps stay as separate per-line boxes.
+            const mergedLineBoxes = [];
+            for (const sb of rawSubBoxes) {
+              const sameLine = mergedLineBoxes.find((mb) => Math.abs(mb.y - sb.y) <= 8);
+              if (!sameLine) {
+                mergedLineBoxes.push({ ...sb });
+              } else {
+                const minX = Math.min(sameLine.x, sb.x);
+                const minY = Math.min(sameLine.y, sb.y);
+                const maxX = Math.max(sameLine.x + sameLine.width, sb.x + sb.width);
+                const maxY = Math.max(sameLine.y + sameLine.height, sb.y + sb.height);
+                sameLine.x = Number(minX.toFixed(2));
+                sameLine.y = Number(minY.toFixed(2));
+                sameLine.width = Number((maxX - minX).toFixed(2));
+                sameLine.height = Number((maxY - minY).toFixed(2));
+              }
+            }
+
+            const minX = Math.min(...mergedLineBoxes.map((b) => b.x));
+            const minY = Math.min(...mergedLineBoxes.map((b) => b.y));
+            const maxX = Math.max(...mergedLineBoxes.map((b) => b.x + b.width));
+            const maxY = Math.max(...mergedLineBoxes.map((b) => b.y + b.height));
 
             return {
               boundingBox: {
@@ -312,7 +412,7 @@ export function findBoundingBoxForMatch(matchText, page, usedBoxKeys) {
                 height: Number((maxY - minY).toFixed(2)),
                 coordinateSpace: 'pdf-top-left-points',
               },
-              boundingBoxes,
+              boundingBoxes: mergedLineBoxes,
             };
           }
         }
@@ -320,36 +420,87 @@ export function findBoundingBoxForMatch(matchText, page, usedBoxKeys) {
     }
   }
 
+  // Pass 2C: Whitespace- and delimiter-flexible matching inside single or consecutive line elements
+  // Handles cases where PDF text extraction inserts or omits spaces around hyphens/colons/slashes.
+  const compactTarget = normalizedTarget.replace(/[\s-]+/g, '');
+  if (compactTarget.length >= 6) {
+    for (let elIdx = 0; elIdx < candidateLines.length; elIdx++) {
+      const el = candidateLines[elIdx];
+      const elText = (el.text || '').replace(/\s+/g, ' ').trim();
+      const elLower = elText.toLowerCase();
+      if (!elLower) continue;
+
+      // Build character mapping from compact string back to elLower indices
+      const charMap = [];
+      let compactEl = '';
+      for (let cIdx = 0; cIdx < elLower.length; cIdx++) {
+        const ch = elLower[cIdx];
+        if (!/[\s-]/.test(ch)) {
+          charMap.push(cIdx);
+          compactEl += ch;
+        }
+      }
+
+      let cSearch = 0;
+      while (cSearch < compactEl.length) {
+        const cMatchIdx = compactEl.indexOf(compactTarget, cSearch);
+        if (cMatchIdx === -1) break;
+        cSearch = cMatchIdx + compactTarget.length;
+
+        const origStart = charMap[cMatchIdx];
+        const origEnd = charMap[cMatchIdx + compactTarget.length - 1] + 1;
+        const origLen = origEnd - origStart;
+        const boxKey = `line_compact_${elIdx}_${origStart}_${origLen}`;
+        if (!usedBoxKeys.has(boxKey)) {
+          usedBoxKeys.add(boxKey);
+          const subBox = buildSubBoxInLineElement(el, origStart, origLen, page.width);
+          return {
+            boundingBox: subBox,
+            boundingBoxes: [subBox],
+          };
+        }
+      }
+    }
+  }
+
   // =========================================================================
-  // STRATEGY 3: Ordered Contiguous Sub-Token Window Match (Fixes H-1 & H-2)
-  // Requires at least 60% of split tokens (and at least the starting token) to
-  // appear in order within a contiguous window of page words, preventing a single
-  // common word (like a city name in the header) from anchoring the bounding box.
+  // STRATEGY 3: Ordered Contiguous Sub-Token Window Match (OCR words or PDF elements)
+  // Requires at least 60% of split tokens (and both first & last tokens) to
+  // appear in order within a contiguous window, preventing a single common word
+  // (like a city name in the header) from anchoring the bounding box.
   // =========================================================================
   const splitTokens = normalizedTarget.split(/[\s,.-]+/).map(cleanToken).filter((t) => t.length >= 2);
-  if (splitTokens.length >= 2 && ocrWords.length > 0) {
+  const wordPool = ocrWords.length > 0 ? ocrWords : candidateLines;
+  if (splitTokens.length >= 2 && wordPool.length > 0) {
     const firstTok = splitTokens[0];
     const lastTok = splitTokens[splitTokens.length - 1];
     const maxWindowLen = splitTokens.length + 4;
 
-    for (let i = 0; i < ocrWords.length; i++) {
-      const wStart = cleanToken(ocrWords[i].text);
-      if (wStart !== firstTok && !isConstrainedPrefixMatch(wStart, firstTok)) continue;
+    for (let i = 0; i < wordPool.length; i++) {
+      const wStartTokens = (wordPool[i].text || '').toLowerCase().split(/[\s,.-]+/).map(cleanToken).filter(Boolean);
+      const hasStart = wStartTokens.some((w) => w === firstTok || isConstrainedPrefixMatch(w, firstTok));
+      if (!hasStart) continue;
 
-      for (let end = i + 1; end < Math.min(ocrWords.length, i + maxWindowLen); end++) {
-        const wEnd = cleanToken(ocrWords[end].text);
-        if (wEnd !== lastTok) continue;
+      for (let end = i; end < Math.min(wordPool.length, i + maxWindowLen); end++) {
+        if (end === i && ocrWords.length > 0) continue;
+        const wEndTokens = (wordPool[end].text || '').toLowerCase().split(/[\s,.-]+/).map(cleanToken).filter(Boolean);
+        const hasEnd = wEndTokens.some((w) => w === lastTok);
+        if (!hasEnd) continue;
 
-        const windowWords = ocrWords.slice(i, end + 1);
+        const windowEls = wordPool.slice(i, end + 1);
+        const windowTokens = windowEls
+          .flatMap((el) => (el.text || '').toLowerCase().split(/[\s,.-]+/).map(cleanToken))
+          .filter(Boolean);
+
         const matchedTokenCount = splitTokens.filter((tok) =>
-          windowWords.some((w) => cleanToken(w.text) === tok || isConstrainedPrefixMatch(cleanToken(w.text), tok))
+          windowTokens.some((w) => w === tok || isConstrainedPrefixMatch(w, tok))
         ).length;
 
         if (matchedTokenCount >= Math.ceil(splitTokens.length * 0.6)) {
-          const winKey = `ocr_window_${i}_${end}`;
+          const winKey = `token_window_${i}_${end}_${normalizedTarget}`;
           if (!usedBoxKeys.has(winKey)) {
             usedBoxKeys.add(winKey);
-            return buildLineBoxesFromElements(windowWords, page.width);
+            return buildLineBoxesFromElements(windowEls, page.width);
           }
         }
       }
@@ -364,8 +515,10 @@ export function findBoundingBoxForMatch(matchText, page, usedBoxKeys) {
  *
  * @param {object} extractionResult - Output from extractPdfContent()
  * @param {string[]} allowedCategories - Optional subset of category keys
+ * @param {object} options - Optional configuration `{ idPrefix: 'det' }`
  */
-export function detectSensitiveInfo(extractionResult, allowedCategories = null) {
+export function detectSensitiveInfo(extractionResult, allowedCategories = null, options = {}) {
+  const { idPrefix = 'det' } = options || {};
   const categorySet =
     Array.isArray(allowedCategories) && allowedCategories.length > 0
       ? new Set(allowedCategories)
@@ -378,10 +531,9 @@ export function detectSensitiveInfo(extractionResult, allowedCategories = null) 
   for (const page of extractionResult.pages || []) {
     const pageText = page.text || '';
     const usedBoxKeys = new Set();
-    // Track character spans [start, end] on pageText to prevent cross-category overlap at the SAME text offset,
-    // while allowing duplicate occurrences of the same value at DIFFERENT offsets on the page (Fixes M-1).
-    const matchedIntervals = [];
 
+    // 1. Collect all candidate regex matches across all active categories on this page
+    const rawCandidates = [];
     for (const pattern of DETECTION_PATTERNS) {
       if (!categorySet.has(pattern.category)) continue;
 
@@ -395,44 +547,46 @@ export function detectSensitiveInfo(extractionResult, allowedCategories = null) 
         const matchStart = match.index + rawMatch.indexOf(matchedText);
         const matchEnd = matchStart + matchedText.length;
 
-        // Skip if this exact character span [matchStart, matchEnd] was already matched
-        // by an equal or higher-priority pattern (e.g., a 10-digit substring inside an Aadhaar or Account number)
-        const overlapsExistingSpan = matchedIntervals.some(
-          (span) => matchStart >= span.start && matchEnd <= span.end
-        );
-        if (overlapsExistingSpan) continue;
-
-        matchedIntervals.push({
+        rawCandidates.push({
           start: matchStart,
           end: matchEnd,
-          category: pattern.category,
+          length: matchedText.length,
           text: matchedText,
+          pattern,
         });
-
-        const boxResult = findBoundingBoxForMatch(matchedText, page, usedBoxKeys);
-        const boundingBox = boxResult ? boxResult.boundingBox : null;
-        const boundingBoxes = boxResult ? boxResult.boundingBoxes : null;
-
-        const confidence = boundingBox ? pattern.confidence : 'LOW_UNCERTAIN';
-        const detectionStatus = boundingBox
-          ? pattern.statusNote
-          : `${pattern.statusNote} (coordinates could not be established on page)`;
-
-        const item = {
-          id: `det_${counter++}`,
-          text: matchedText,
-          category: pattern.category,
-          categoryLabel: pattern.label,
-          confidence,
-          detectionStatus,
-          pageNumber: page.pageNumber,
-          boundingBox,
-          ...(boundingBoxes && boundingBoxes.length > 1 ? { boundingBoxes } : {}),
-        };
-
-        detectedItems.push(item);
-        categoryBreakdown[pattern.category] = (categoryBreakdown[pattern.category] || 0) + 1;
       }
+    }
+
+    // 2. Deterministically resolve any overlapping matches on the same underlying text span
+    //    while preserving genuinely distinct nearby detections.
+    const resolvedCandidates = resolveOverlappingCandidates(rawCandidates, pageText);
+
+    // 3. Map each resolved detection to its PDF page bounding box(es)
+    for (const cand of resolvedCandidates) {
+      const { text: matchedText, pattern } = cand;
+      const boxResult = findBoundingBoxForMatch(matchedText, page, usedBoxKeys);
+      const boundingBox = boxResult ? boxResult.boundingBox : null;
+      const boundingBoxes = boxResult ? boxResult.boundingBoxes : null;
+
+      const confidence = boundingBox ? pattern.confidence : 'LOW_UNCERTAIN';
+      const detectionStatus = boundingBox
+        ? pattern.statusNote
+        : `${pattern.statusNote} (coordinates could not be established on page)`;
+
+      const item = {
+        id: `${idPrefix}_${counter++}`,
+        text: matchedText,
+        category: pattern.category,
+        categoryLabel: pattern.label,
+        confidence,
+        detectionStatus,
+        pageNumber: page.pageNumber,
+        boundingBox,
+        ...(boundingBoxes && boundingBoxes.length > 1 ? { boundingBoxes } : {}),
+      };
+
+      detectedItems.push(item);
+      categoryBreakdown[pattern.category] = (categoryBreakdown[pattern.category] || 0) + 1;
     }
   }
 

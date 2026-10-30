@@ -157,5 +157,6 @@ export function errorHandler(err, _req, res, _next) {
     success: false,
     error: err.code || 'INTERNAL_SERVER_ERROR',
     message: err.message || 'An unexpected error occurred while processing the request.',
+    ...(err.details ? { details: err.details } : {}),
   });
 }

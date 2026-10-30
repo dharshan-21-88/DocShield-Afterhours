@@ -20,6 +20,17 @@ function isValidBox(box) {
 }
 
 /**
+ * Check whether an item has valid boundingBox or boundingBoxes coordinates.
+ */
+export function hasValidItemCoordinates(item) {
+  if (!item) return false;
+  if (Array.isArray(item.boundingBoxes) && item.boundingBoxes.length > 0) {
+    return item.boundingBoxes.every((b) => isValidBox(b));
+  }
+  return isValidBox(item.boundingBox);
+}
+
+/**
  * Permanently redacts a PDF document.
  *
  * Why image-based raster redaction?
@@ -49,6 +60,80 @@ export async function generatePermanentlyRedactedPdf(originalPdfPath, itemsToRed
 
   const pdfDoc = await loadingTask.promise;
   const numPages = pdfDoc.numPages;
+
+  // Pre-validate all selected items across all pages BEFORE rendering or modifying any output
+  // so that if any selected item is unlocatable, we fail safely with a complete list of unlocatable items.
+  const preCheckUnlocatable = [];
+  for (let pageNum = 1; pageNum <= numPages; pageNum++) {
+    const pageItems = itemsToRedact.filter((item) => item.pageNumber === pageNum);
+    if (pageItems.length === 0) continue;
+
+    const page = await pdfDoc.getPage(pageNum);
+    const baseViewport = page.getViewport({ scale: 1.0 });
+    const textContent = await page.getTextContent();
+    const rawTextItems = textContent.items || [];
+
+    for (const item of pageItems) {
+      if (hasValidItemCoordinates(item)) continue;
+
+      // Check whether raw PDF text streams on this page can locate the item
+      const targetNorm = (item.text || '').replace(/\s+/g, ' ').trim().toLowerCase();
+      let foundInRaw = false;
+      if (targetNorm) {
+        for (const raw of rawTextItems) {
+          const rawStr = (raw.str || '').replace(/\s+/g, ' ').trim();
+          if (rawStr && rawStr.toLowerCase().includes(targetNorm)) {
+            const tx = raw.transform ? raw.transform[4] : 0;
+            const ty = raw.transform ? raw.transform[5] : 0;
+            const fontH = Math.max(Math.abs(raw.height || (raw.transform ? raw.transform[3] : 12)), 11);
+            const rawW = Math.max(raw.width || rawStr.length * (fontH * 0.6), 20);
+            const topY = Math.max(0, baseViewport.height - ty - fontH * 0.9);
+            const matchIdx = rawStr.toLowerCase().indexOf(targetNorm);
+            const startRatio = Math.max(0, (matchIdx - 1) / Math.max(rawStr.length, 1));
+            const widthRatio = Math.min(1 - startRatio, (targetNorm.length + 2) / Math.max(rawStr.length, 1));
+
+            item.boundingBox = {
+              x: Number(Math.max(0, tx + rawW * startRatio - 3).toFixed(2)),
+              y: Number(Math.max(0, topY - 2).toFixed(2)),
+              width: Number(Math.max(rawW * widthRatio + 8, 24).toFixed(2)),
+              height: Number((fontH * 1.3 + 4).toFixed(2)),
+              coordinateSpace: 'pdf-top-left-points',
+            };
+            foundInRaw = true;
+            break;
+          }
+        }
+      }
+
+      if (!foundInRaw) {
+        preCheckUnlocatable.push({
+          id: item.id,
+          category: item.category,
+          categoryLabel: item.categoryLabel,
+          pageNumber: item.pageNumber,
+          confidence: item.confidence || 'LOW_UNCERTAIN',
+          reason:
+            'Bounding box coordinates could not be established on the PDF page. Manual review or selective redaction of locatable items is required.',
+        });
+      }
+    }
+  }
+
+  if (preCheckUnlocatable.length > 0) {
+    const failedIds = preCheckUnlocatable.map((u) => `${u.id} (page ${u.pageNumber}, ${u.category})`).join(', ');
+    const err = new Error(
+      `Redaction aborted safely: ${preCheckUnlocatable.length} selected detection(s) lack valid page coordinates [${failedIds}]. The document was not modified. Review the unlocatable items or use selective redaction for verified items.`
+    );
+    err.code = 'REDACTION_COORDINATES_MISSING';
+    err.statusCode = 422;
+    err.details = {
+      unlocatableCount: preCheckUnlocatable.length,
+      unlocatableItems: preCheckUnlocatable,
+      guidance:
+        'Automatic redaction never silently skips unlocatable sensitive items. Inspect the listed items in unlocatableItems or use mode="selective" with locatable item IDs.',
+    };
+    throw err;
+  }
 
   // Create a brand new, empty PDF document via pdf-lib (contains zero original text objects)
   const outputPdf = await PDFDocument.create();
@@ -150,6 +235,19 @@ export async function generatePermanentlyRedactedPdf(originalPdfPath, itemsToRed
         );
         err.code = 'REDACTION_COORDINATES_MISSING';
         err.statusCode = 422;
+        err.details = {
+          unlocatableCount: 1,
+          unlocatableItems: [
+            {
+              id: item.id,
+              category: item.category,
+              categoryLabel: item.categoryLabel,
+              pageNumber: pageNum,
+              confidence: item.confidence || 'LOW_UNCERTAIN',
+              reason: 'Bounding box coordinates could not be established on the PDF page.',
+            },
+          ],
+        };
         throw err;
       }
     }

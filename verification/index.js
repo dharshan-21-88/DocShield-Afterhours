@@ -54,11 +54,40 @@ export async function verifyRedactedPdf(redactedFilePath, originalDetectedItems 
   }
 
   // Run the sensitive information detector on the redacted PDF's extracted/OCR text
-  const postDetection = detectSensitiveInfo(extraction);
+  // Use `ver_det` prefix so post-redaction detection IDs never collide with original `det_N` IDs
+  const postDetection = detectSensitiveInfo(extraction, null, { idPrefix: 'ver_det' });
+
+  // Correlate post-redaction detections with unselected original detections where applicable
+  const usedOriginalUnselectedIds = new Set();
+  const remainingItems = postDetection.items.map((postItem) => {
+    const postNorm = (postItem.text || '').trim().toLowerCase();
+    const matchingUnselected = unselectedItems.find(
+      (u) =>
+        !usedOriginalUnselectedIds.has(u.id) &&
+        u.pageNumber === postItem.pageNumber &&
+        (u.text || '').trim().toLowerCase() === postNorm
+    );
+
+    if (matchingUnselected) {
+      usedOriginalUnselectedIds.add(matchingUnselected.id);
+      return {
+        ...postItem,
+        originalDetectionId: matchingUnselected.id,
+        verificationStatus: 'UNSELECTED_REMAINING',
+      };
+    }
+
+    return {
+      ...postItem,
+      originalDetectionId: null,
+      verificationStatus: 'NEWLY_DETECTED_OR_REMAINING',
+    };
+  });
 
   // Also check if any unselected items from before redaction remain in the text
-  const remainingItems = [...postDetection.items];
+  let fallbackVerCounter = postDetection.items.length + 1;
   for (const unsel of unselectedItems) {
+    if (usedOriginalUnselectedIds.has(unsel.id)) continue;
     const rawTarget = (unsel.text || '').trim().toLowerCase();
     if (rawTarget && combinedAfterText.includes(rawTarget)) {
       const alreadyListed = remainingItems.some(
@@ -67,6 +96,9 @@ export async function verifyRedactedPdf(redactedFilePath, originalDetectedItems 
       if (!alreadyListed) {
         remainingItems.push({
           ...unsel,
+          id: `ver_det_${fallbackVerCounter++}`,
+          originalDetectionId: unsel.id,
+          verificationStatus: 'UNSELECTED_REMAINING',
           detectionStatus: 'Unselected item still detectable in exported document',
         });
       }

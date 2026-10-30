@@ -247,6 +247,7 @@ export const openApiSpec = {
                         'ADDRESS',
                         'STUDENT_REG_NUMBER',
                         'NATIONAL_ID_AADHAAR',
+                        'NATIONAL_ID_PAN',
                         'FINANCIAL_ACCOUNT',
                       ],
                     },
@@ -352,6 +353,14 @@ export const openApiSpec = {
           },
           404: {
             description: 'Document not found',
+            content: {
+              'application/json': {
+                schema: { $ref: '#/components/schemas/ErrorResponse' },
+              },
+            },
+          },
+          422: {
+            description: 'One or more selected detections lack valid page coordinates (REDACTION_COORDINATES_MISSING)',
             content: {
               'application/json': {
                 schema: { $ref: '#/components/schemas/ErrorResponse' },
@@ -562,6 +571,7 @@ export const openApiSpec = {
               'ADDRESS',
               'STUDENT_REG_NUMBER',
               'NATIONAL_ID_AADHAAR',
+              'NATIONAL_ID_PAN',
               'FINANCIAL_ACCOUNT',
             ],
             example: 'NATIONAL_ID_AADHAAR',

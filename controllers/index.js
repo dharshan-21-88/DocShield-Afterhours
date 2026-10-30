@@ -12,8 +12,8 @@ import {
 } from '../config/storage.js';
 import { extractPdfContent } from '../extraction/index.js';
 import { SAMPLE_SCENARIOS, generateSamplePdfFile } from '../extraction/samples.js';
-import { detectSensitiveInfo } from '../detection/index.js';
-import { generatePermanentlyRedactedPdf } from '../redaction/index.js';
+import { detectSensitiveInfo, findBoundingBoxForMatch } from '../detection/index.js';
+import { generatePermanentlyRedactedPdf, hasValidItemCoordinates } from '../redaction/index.js';
 import { verifyRedactedPdf } from '../verification/index.js';
 import { buildPrivacyAssessmentReport } from '../reports/index.js';
 
@@ -237,15 +237,38 @@ export async function redactPdfController(req, res, next) {
       itemsToRedact = detectedItems.filter((item) => idSet.has(item.id));
     }
 
-    // Clean up any previous redacted file for this document before generating a new one
-    if (docRecord.redactedFilePath) {
-      await safeDeleteFile(docRecord.redactedFilePath);
+    // Attempt coordinate recovery against extracted page elements for any selected item missing coordinates
+    const pagesByNum = new Map((docRecord.extraction?.pages || []).map((p) => [p.pageNumber, p]));
+    const usedKeysByPage = new Map();
+    for (const item of itemsToRedact) {
+      if (!hasValidItemCoordinates(item)) {
+        const pageObj = pagesByNum.get(item.pageNumber);
+        if (pageObj) {
+          if (!usedKeysByPage.has(item.pageNumber)) {
+            usedKeysByPage.set(item.pageNumber, new Set());
+          }
+          const resolved = findBoundingBoxForMatch(item.text, pageObj, usedKeysByPage.get(item.pageNumber));
+          if (resolved && resolved.boundingBox) {
+            item.boundingBox = resolved.boundingBox;
+            if (Array.isArray(resolved.boundingBoxes) && resolved.boundingBoxes.length > 1) {
+              item.boundingBoxes = resolved.boundingBoxes;
+            }
+          }
+        }
+      }
     }
+
+    const previousRedactedPath = docRecord.redactedFilePath;
 
     const redactionOutput = await generatePermanentlyRedactedPdf(
       docRecord.originalFilePath,
       itemsToRedact
     );
+
+    // Clean up any previous redacted file only after the new redaction has succeeded
+    if (previousRedactedPath && previousRedactedPath !== redactionOutput.redactedFilePath) {
+      await safeDeleteFile(previousRedactedPath);
+    }
 
     const chosenIds = itemsToRedact.map((i) => i.id);
     updateDocumentRecord(documentId, {
