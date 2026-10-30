@@ -138,8 +138,8 @@ export function buildPageObstaclesForItem({
     const rawElText = (el.text || '').replace(/\s+/g, ' ').trim();
     if (!rawElText) continue;
 
-    // Ignore pure standalone punctuation tokens in OCR
-    if (/^[\s.,;:!?)-\]]+$/.test(rawElText)) continue;
+    // Ignore pure standalone punctuation tokens in OCR (note escaped hyphen so ASCII range )-] is not created)
+    if (/^[\s.,;:!?)\-\]]+$/.test(rawElText)) continue;
 
     // AcroForm widget and annotation containers that overlap a selected item are the field box itself
     if (el.source === 'pdf-acroform-widget' || el.source === 'pdf-annotation') {
@@ -184,8 +184,8 @@ export function buildPageObstaclesForItem({
 
     // Left prefix obstacle: if the line element starts well to the left of the leftmost selected box on this element
     const minSelX = Math.min(...overlappingSelected.map(({ box }) => box.x));
-    if (minSelX - el.x > 8) {
-      const prefixRight = Math.max(el.x + 2, minSelX - 5);
+    if (minSelX - el.x > 6) {
+      const prefixRight = Math.max(el.x + 2, minSelX - 2.5);
       obstacles.push({
         x: el.x,
         y: el.y,
@@ -213,7 +213,7 @@ export function buildPageObstaclesForItem({
         }
       }
 
-      const trailingCleaned = trailingSubstr.replace(/^[\s.,;:!?)-\]|/]+/, '').trim();
+      const trailingCleaned = trailingSubstr.replace(/^[\s.,;:!?)\-\]|/]+/, '').trim();
       if (trailingCleaned.length > 0) {
         const firstToken = trailingCleaned.split(/\s+/)[0];
         const suffixCharIdx = rawElText.indexOf(firstToken, matchEnd);
@@ -273,8 +273,8 @@ export function computeObfuscatedMaskGeometry(originalBox, options = {}) {
   const pageWidth = Number(options.pageDimensions?.width) || 595.28;
   const pageHeight = Number(options.pageDimensions?.height) || 841.89;
   const obstacles = Array.isArray(options.obstacles) ? options.obstacles : [];
-  const padX = typeof options.padX === 'number' ? options.padX : 4;
-  const padY = typeof options.padY === 'number' ? options.padY : 3;
+  const padX = typeof options.padX === 'number' ? options.padX : 2;
+  const padY = typeof options.padY === 'number' ? options.padY : 1.5;
   const meta = options.itemMetadata || {};
 
   // Base padded box (incorporating optional proportional-font glyph coverage box if unobstructed)
@@ -290,19 +290,14 @@ export function computeObfuscatedMaskGeometry(originalBox, options = {}) {
     const gcTop = Math.max(0, gc.y);
     const gcBottom = Math.min(pageHeight, gc.y + gc.height);
 
-    // Only widen base glyph coverage if it does not collide with an unselected detection or neighbor obstacle
+    // Only widen base glyph coverage if it does not collide with an unselected detection or neighbor/prefix obstacle
     const hitsObstacleLeft = obstacles.some((obs) => {
       const vOv = Math.min(baseBottom, obs.y + obs.height) - Math.max(baseTop, obs.y);
-      return (
-        vOv > 1 &&
-        obs.type !== 'LINE_PREFIX_TEXT' &&
-        obs.x + obs.width <= orig.x + 2 &&
-        obs.x + obs.width > gcLeft
-      );
+      return vOv > 1 && obs.x + obs.width <= orig.x + 2 && obs.x + obs.width + 1.5 > gcLeft;
     });
     const hitsObstacleRight = obstacles.some((obs) => {
       const vOv = Math.min(baseBottom, obs.y + obs.height) - Math.max(baseTop, obs.y);
-      return vOv > 1 && obs.x >= orig.x + orig.width - 2 && obs.x < gcRight;
+      return vOv > 1 && obs.x >= orig.x + orig.width - 2 && obs.x - 1.5 < gcRight;
     });
 
     if (!hitsObstacleLeft) baseLeft = Math.min(baseLeft, gcLeft);
@@ -311,17 +306,18 @@ export function computeObfuscatedMaskGeometry(originalBox, options = {}) {
     baseBottom = Math.max(baseBottom, gcBottom);
   }
 
-  // Ensure base padding never intrudes into an adjacent unselected detection on the same line
+  // Ensure base padding never intrudes into an adjacent unselected detection or same-line prefix/suffix/neighbor obstacle
   for (const obs of obstacles) {
-    if (obs.type !== 'UNSELECTED_DETECTION') continue;
+    if (!isValidBox(obs)) continue;
     const vOv = Math.min(baseBottom - 1, obs.y + obs.height) - Math.max(baseTop + 1, obs.y);
     if (vOv <= 0) continue;
 
-    if (obs.x >= orig.x + orig.width - 2 && obs.x - 1.5 < baseRight) {
-      baseRight = Math.max(orig.x + orig.width, obs.x - 1.5);
+    const clearance = obs.type === 'UNSELECTED_DETECTION' ? 2.0 : 1.5;
+    if (obs.x >= orig.x + orig.width - 2 && obs.x - clearance < baseRight) {
+      baseRight = Math.max(orig.x + orig.width, obs.x - clearance);
     }
-    if (obs.x + obs.width <= orig.x + 2 && obs.x + obs.width + 1.5 > baseLeft) {
-      baseLeft = Math.min(orig.x, obs.x + obs.width + 1.5);
+    if (obs.x + obs.width <= orig.x + 2 && obs.x + obs.width + clearance > baseLeft) {
+      baseLeft = Math.min(orig.x, obs.x + obs.width + clearance);
     }
   }
 
@@ -675,8 +671,8 @@ export async function generatePermanentlyRedactedPdf(
 
     for (const item of pageItems) {
       let drewBox = false;
-      const padX = 4;
-      const padY = 3;
+      const padX = 2;
+      const padY = 1.5;
 
       const singleOrigBox = isValidBox(item.boundingBox)
         ? item.boundingBox
@@ -738,16 +734,16 @@ export async function generatePermanentlyRedactedPdf(
             }
 
             const matchIdx = rawStr.toLowerCase().indexOf(targetNorm);
-            const startRatio = Math.max(0, (matchIdx - 1) / Math.max(rawStr.length, 1));
+            const startRatio = Math.max(0, matchIdx / Math.max(rawStr.length, 1));
             const widthRatio = Math.min(
               1 - startRatio,
-              (targetNorm.length + 2) / Math.max(rawStr.length, 1)
+              targetNorm.length / Math.max(rawStr.length, 1)
             );
             glyphCoverageBox = {
-              x: Math.max(0, tx + rawW * startRatio - 3),
-              y: Math.max(0, topY - 3),
-              width: rawW * widthRatio + 10,
-              height: fontH * 1.35 + 4,
+              x: Math.max(0, tx + rawW * startRatio - 1.5),
+              y: Math.max(0, topY - 1.5),
+              width: rawW * widthRatio + 4,
+              height: fontH * 1.2 + 3,
               coordinateSpace: 'pdf-top-left-points',
             };
             consumedRawIndices.add(rawIdx);

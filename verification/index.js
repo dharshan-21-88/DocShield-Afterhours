@@ -917,17 +917,33 @@ export async function verifyRedactedPdf(
     const usedOriginalUnselectedIds = new Set();
     remainingItems = postDetection.items.map((postItem) => {
       const postNorm = (postItem.text || '').trim().toLowerCase();
-      const matchingUnselected = unselectedItems.find(
-        (u) =>
-          !usedOriginalUnselectedIds.has(u.id) &&
-          u.pageNumber === postItem.pageNumber &&
-          (u.text || '').trim().toLowerCase() === postNorm
-      );
+      const postCompact = postNorm.replace(/[\s-]+/g, '');
+      const matchingUnselected = unselectedItems.find((u) => {
+        if (usedOriginalUnselectedIds.has(u.id) || u.pageNumber !== postItem.pageNumber) {
+          return false;
+        }
+        const unselNorm = (u.text || '').trim().toLowerCase();
+        if (unselNorm === postNorm) return true;
+
+        // Handle OCR intra-token whitespace splits (e.g., "preserve. me@fictional-univ.edu" where regex
+        // matched "me@fictional-univ.edu" while compact page OCR text contains the full unselected value)
+        const unselCompact = unselNorm.replace(/[\s-]+/g, '');
+        if (
+          u.category === postItem.category &&
+          postCompact.length >= 6 &&
+          unselCompact.includes(postCompact) &&
+          compactAfterText.includes(unselCompact)
+        ) {
+          return true;
+        }
+        return false;
+      });
 
       if (matchingUnselected) {
         usedOriginalUnselectedIds.add(matchingUnselected.id);
         return {
           ...postItem,
+          text: matchingUnselected.text,
           originalDetectionId: matchingUnselected.id,
           verificationStatus: 'UNSELECTED_REMAINING',
         };
@@ -940,12 +956,16 @@ export async function verifyRedactedPdf(
       };
     });
 
-    // Also check if any unselected items from before redaction remain in the text
+    // Also check if any unselected items from before redaction remain in the text (exact or compact OCR match)
     let fallbackVerCounter = postDetection.items.length + 1;
     for (const unsel of unselectedItems) {
       if (usedOriginalUnselectedIds.has(unsel.id)) continue;
       const rawTarget = (unsel.text || '').trim().toLowerCase();
-      if (rawTarget && combinedAfterText.includes(rawTarget)) {
+      const compactTarget = rawTarget.replace(/[\s-]+/g, '');
+      const presentExact = rawTarget.length > 0 && combinedAfterText.includes(rawTarget);
+      const presentCompact = compactTarget.length >= 6 && compactAfterText.includes(compactTarget);
+
+      if (presentExact || presentCompact) {
         const alreadyListed = remainingItems.some(
           (r) => r.text.trim().toLowerCase() === rawTarget && r.pageNumber === unsel.pageNumber
         );
