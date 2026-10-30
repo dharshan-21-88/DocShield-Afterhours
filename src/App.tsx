@@ -32,9 +32,11 @@ export default function App() {
   }
   const scan = () => run('Scanning PDF…', async () => {
     if (!file) throw new Error('Choose a PDF first.');
-    if (file.type && file.type !== 'application/pdf' && !file.name.toLowerCase().endsWith('.pdf')) throw new Error('Please upload a PDF file.');
+    const isPdf = file.type === 'application/pdf' || file.name.toLowerCase().endsWith('.pdf');
+    const isImage = ['image/png', 'image/jpeg'].includes(file.type) || /\.(png|jpe?g)$/i.test(file.name);
+    if (!isPdf && !isImage) throw new Error('Choose a PDF, PNG, or JPEG image.');
     const form = new FormData(); form.append('file', file);
-    const uploaded = await api('/api/upload', { method: 'POST', body: form });
+    const uploaded = await api(isImage ? '/api/upload-image' : '/api/upload', { method: 'POST', body: form });
     const id = uploaded.documentId;
     if (!id) throw new Error('Upload succeeded but the API did not return a document ID.');
     setDocumentId(id);
@@ -73,9 +75,9 @@ export default function App() {
       <section className="steps">{[['01','Upload','Choose a PDF'],['02','Inspect','Review possible leaks'],['03','Protect','Redact and verify']].map((s,i)=><div key={s[0]} className={'step '+(stage===i?'current':stage>i?'complete':'')}><div className="step-num">{stage>i?'✓':s[0]}</div><div><b>{s[1]}</b><small>{s[2]}</small></div></div>)}</section>
       {error && <div className="error-banner"><AlertTriangle size={18}/><span>{error}</span><button onClick={()=>setError('')}>Dismiss</button></div>}
       <div className="content-grid">
-        <section className="panel upload-panel"><div className="panel-head"><div><div className="section-kicker">01 / DOCUMENT</div><h2>Inspect a document</h2><p>Upload a PDF to scan for sensitive information.</p></div><div className="panel-icon"><FileText size={20}/></div></div>
-          <label className="dropzone"><input type="file" accept="application/pdf,.pdf" onChange={e=>{setFile(e.target.files?.[0] || null);setError('');}}/><div className="upload-icon"><UploadCloud size={25}/></div><b>{file ? file.name : 'Choose a PDF to begin'}</b><span>{file ? (file.size/1024/1024).toFixed(2)+' MB · Ready to scan' : 'Click here to browse files'}</span><small>PDF only · Server size limits apply</small></label>
-          <button className="primary-btn full" disabled={!file || !!busy} onClick={scan}>{busy ? <><RefreshCw className="spin" size={17}/>{busy}</> : <><ScanSearch size={17}/> Scan for sensitive data <span>→</span></>}</button>
+        <section className="panel upload-panel"><div className="panel-head"><div><div className="section-kicker">01 / DOCUMENT</div><h2>Inspect a document</h2><p>Upload a PDF, screenshot, or photo to extract sensitive information with OCR.</p></div><div className="panel-icon"><FileText size={20}/></div></div>
+          <label className="dropzone"><input type="file" accept="application/pdf,.pdf,image/png,image/jpeg,.png,.jpg,.jpeg" onChange={e=>{setFile(e.target.files?.[0] || null);setError('');}}/><div className="upload-icon"><UploadCloud size={25}/></div><b>{file ? file.name : 'Choose a PDF or image to begin'}</b><span>{file ? (file.size/1024/1024).toFixed(2)+' MB · Ready to scan' : 'Click here to browse files'}</span><small>PDF only · Server size limits apply</small></label>
+          <button className="primary-btn full" disabled={!file || !!busy} onClick={scan}>{busy ? <><RefreshCw className="spin" size={17}/>{busy}</> : <><ScanSearch size={17}/> Extract & scan sensitive data <span>→</span></>}</button>
           <div className="privacy-note"><LockKeyhole size={15}/><span>Use sample or authorized documents. Automated detection can miss information; review the output before sharing.</span></div>
           {documentId && <div className="doc-chip"><CheckCircle2 size={16}/><span><b>Document scanned</b><small>{documentId}</small></span></div>}
         </section>
