@@ -1,0 +1,15 @@
+node_modules/
+build/
+dist/
+coverage/
+.DS_Store
+*.log
+.env*
+!.env.example
+
+# Temporary document-processing directories and OCR cache files
+.tmp_uploads/
+.tmp_redacted/
+.tmp_samples/
+*.traineddata
+

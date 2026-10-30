@@ -1,0 +1,6 @@
+{
+  "name": "DocShield – Smart Document Privacy Protector API",
+  "description": "Backend REST API and Swagger documentation for DocShield: PDF upload, OCR & text extraction, sensitive data detection, permanent redaction, post-redaction verification, and SHA-256 privacy assessment reports.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
