@@ -1,4 +1,6 @@
 import crypto from 'crypto';
+import { PDFDocument } from 'pdf-lib';
+import path from 'path';
 import fs from 'fs';
 import { config } from '../config/index.js';
 import {
@@ -383,4 +385,40 @@ export function downloadRedactedPdfController(req, res) {
 
   const stream = fs.createReadStream(docRecord.redactedFilePath);
   stream.pipe(res);
+}
+
+
+/**
+ * POST /api/upload-image
+ * Converts a PNG/JPEG image into a one-page PDF, then reuses OCR, detection,
+ * permanent raster redaction, and verification already used for PDFs.
+ */
+export async function uploadImageController(req, res, next) {
+  let convertedPath;
+  try {
+    if (!req.file?.buffer) {
+      return res.status(400).json({ success: false, error: 'MISSING_FILE', message: 'Choose a PNG or JPEG image.' });
+    }
+    const pdf = await PDFDocument.create();
+    const image = req.file.mimetype === 'image/png'
+      ? await pdf.embedPng(req.file.buffer)
+      : await pdf.embedJpg(req.file.buffer);
+    const maxWidth = 595.28;
+    const maxHeight = 841.89;
+    const scale = Math.min(maxWidth / image.width, maxHeight / image.height, 1);
+    const width = image.width * scale;
+    const height = image.height * scale;
+    const page = pdf.addPage([width, height]);
+    page.drawImage(image, { x: 0, y: 0, width, height });
+    const bytes = await pdf.save();
+    const safeName = (req.file.originalname || 'uploaded-image').replace(/[^a-zA-Z0-9._-]/g, '_');
+    convertedPath = path.join(config.upload.tempDir, `image_${Date.now()}_${crypto.randomUUID()}.pdf`);
+    await fs.promises.writeFile(convertedPath, bytes);
+    const responsePayload = await processUploadedPdfFile(convertedPath, safeName.replace(/\.(png|jpe?g)$/i, '') + '.pdf', bytes.length);
+    convertedPath = null; // document registry now owns the converted PDF
+    res.status(201).json({ ...responsePayload, sourceType: 'image', sourceFileName: safeName, message: 'Image converted and OCR-scanned. Review detected fields before redacting.' });
+  } catch (err) {
+    if (convertedPath) await safeDeleteFile(convertedPath);
+    next(err);
+  }
 }
