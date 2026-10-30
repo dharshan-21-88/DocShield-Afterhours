@@ -1,11 +1,11 @@
 import fs from 'fs/promises';
 import * as pdfjsLib from 'pdfjs-dist/legacy/build/pdf.mjs';
 import { createCanvas } from '@napi-rs/canvas';
-import Tesseract from 'tesseract.js';
+import { createWorker } from 'tesseract.js';
 
 /**
  * Custom CanvasFactory required by pdfjs-dist in Node.js environments
- * to render PDF pages onto node-canvas instances.
+ * to render PDF pages onto @napi-rs/canvas instances.
  */
 class NodeCanvasFactory {
   create(width, height) {
@@ -57,6 +57,64 @@ export async function renderPageToCanvas(page, scale = 2.0) {
 }
 
 /**
+ * Extract word-level and line-level OCR elements from Tesseract.js v7 blocks hierarchy,
+ * converting pixel bounding boxes into 1.0x PDF point coordinates.
+ */
+function extractOcrElementsFromData(ocrData, ocrScale) {
+  const ocrElements = [];
+  const blocks = ocrData?.blocks || [];
+
+  for (const block of blocks) {
+    const paragraphs = block?.paragraphs || [];
+    for (const para of paragraphs) {
+      const lines = para?.lines || [];
+      for (const ln of lines) {
+        // First collect all word-level bounding boxes in this line
+        const words = ln?.words || [];
+        for (const w of words) {
+          const wordText = (w?.text || '').trim();
+          if (!wordText || !w?.bbox) continue;
+
+          const x = w.bbox.x0 / ocrScale;
+          const y = w.bbox.y0 / ocrScale;
+          const width = (w.bbox.x1 - w.bbox.x0) / ocrScale;
+          const height = (w.bbox.y1 - w.bbox.y0) / ocrScale;
+
+          ocrElements.push({
+            text: wordText,
+            x: Number(x.toFixed(2)),
+            y: Number(y.toFixed(2)),
+            width: Number(Math.max(width, 4).toFixed(2)),
+            height: Number(Math.max(height, 8).toFixed(2)),
+            source: 'ocr',
+          });
+        }
+
+        // Also store the line-level bounding box
+        const lineText = (ln?.text || '').trim();
+        if (lineText && ln?.bbox) {
+          const x = ln.bbox.x0 / ocrScale;
+          const y = ln.bbox.y0 / ocrScale;
+          const width = (ln.bbox.x1 - ln.bbox.x0) / ocrScale;
+          const height = (ln.bbox.y1 - ln.bbox.y0) / ocrScale;
+
+          ocrElements.push({
+            text: lineText,
+            x: Number(x.toFixed(2)),
+            y: Number(y.toFixed(2)),
+            width: Number(Math.max(width, 10).toFixed(2)),
+            height: Number(Math.max(height, 10).toFixed(2)),
+            source: 'ocr-line',
+          });
+        }
+      }
+    }
+  }
+
+  return ocrElements;
+}
+
+/**
  * Extract embedded text and bounding-box items from a PDF file.
  * Automatically falls back to Tesseract.js OCR for any page that has little/no embedded text.
  *
@@ -104,124 +162,103 @@ export async function extractPdfContent(filePath, options = {}) {
   const pages = [];
   let usedOcrFallback = false;
   let usedPdfText = false;
+  let ocrWorker = null;
 
-  for (let pageNum = 1; pageNum <= numPages; pageNum++) {
-    const page = await pdfDoc.getPage(pageNum);
-    const viewport = page.getViewport({ scale: 1.0 });
-    const pageWidth = viewport.width;
-    const pageHeight = viewport.height;
+  try {
+    for (let pageNum = 1; pageNum <= numPages; pageNum++) {
+      const page = await pdfDoc.getPage(pageNum);
+      const viewport = page.getViewport({ scale: 1.0 });
+      const pageWidth = viewport.width;
+      const pageHeight = viewport.height;
 
-    const textContent = await page.getTextContent();
-    const rawItems = textContent.items || [];
+      const textContent = await page.getTextContent();
+      const rawItems = textContent.items || [];
 
-    // Convert PDF.js text items into normalized top-left coordinate items (PDF points)
-    const textElements = [];
-    const textLines = [];
+      // Convert PDF.js text items into normalized top-left coordinate items (PDF points)
+      const textElements = [];
+      const textLines = [];
 
-    for (const item of rawItems) {
-      const str = (item.str || '').trim();
-      if (!str) continue;
+      for (const item of rawItems) {
+        const str = (item.str || '').trim();
+        if (!str) continue;
 
-      // item.transform is [scaleX, skewY, skewX, scaleY, tx, ty] in bottom-left PDF coordinates
-      const tx = item.transform ? item.transform[4] : 0;
-      const ty = item.transform ? item.transform[5] : 0;
-      const fontHeight = Math.max(
-        Math.abs(item.height || (item.transform ? item.transform[3] : 12)),
-        10
-      );
-      const width = Math.max(item.width || str.length * (fontHeight * 0.55), 8);
+        // item.transform is [scaleX, skewY, skewX, scaleY, tx, ty] in bottom-left PDF coordinates
+        const tx = item.transform ? item.transform[4] : 0;
+        const ty = item.transform ? item.transform[5] : 0;
+        const fontHeight = Math.max(
+          Math.abs(item.height || (item.transform ? item.transform[3] : 12)),
+          10
+        );
+        const width = Math.max(item.width || str.length * (fontHeight * 0.55), 8);
 
-      // Convert bottom-left baseline (tx, ty) to top-left bounding box (x, y, width, height)
-      const topY = Math.max(0, pageHeight - ty - fontHeight * 0.85);
+        // Convert bottom-left baseline (tx, ty) to top-left bounding box (x, y, width, height)
+        const topY = Math.max(0, pageHeight - ty - fontHeight * 0.85);
 
-      textElements.push({
-        text: item.str,
-        x: Number(tx.toFixed(2)),
-        y: Number(topY.toFixed(2)),
-        width: Number(width.toFixed(2)),
-        height: Number((fontHeight * 1.2).toFixed(2)),
-        source: 'pdf-text',
-      });
-      textLines.push(item.str);
-    }
-
-    const joinedPdfText = textLines.join(' ').replace(/\s+/g, ' ').trim();
-    let pageMethod = 'pdf-text';
-    let finalPageText = joinedPdfText;
-    let finalElements = textElements;
-
-    // Trigger OCR fallback if page has fewer than 15 characters of embedded text OR forceOcr is enabled
-    if (forceOcr || joinedPdfText.length < 15) {
-      usedOcrFallback = true;
-      pageMethod = joinedPdfText.length < 15 ? 'ocr-fallback' : 'hybrid';
-
-      const ocrScale = 2.0;
-      const { canvas } = await renderPageToCanvas(page, ocrScale);
-      const imageBuffer = canvas.toBuffer('image/png');
-
-      const ocrResult = await Tesseract.recognize(imageBuffer, 'eng');
-      const ocrData = ocrResult?.data || {};
-      const ocrText = (ocrData.text || '').trim();
-
-      const ocrElements = [];
-      const words = ocrData.words || [];
-      for (const w of words) {
-        const wordText = (w.text || '').trim();
-        if (!wordText || !w.bbox) continue;
-        // Convert pixel bbox back to 1.0x PDF point space
-        const x = w.bbox.x0 / ocrScale;
-        const y = w.bbox.y0 / ocrScale;
-        const width = (w.bbox.x1 - w.bbox.x0) / ocrScale;
-        const height = (w.bbox.y1 - w.bbox.y0) / ocrScale;
-        ocrElements.push({
-          text: wordText,
-          x: Number(x.toFixed(2)),
-          y: Number(y.toFixed(2)),
-          width: Number(Math.max(width, 6).toFixed(2)),
-          height: Number(Math.max(height, 10).toFixed(2)),
-          source: 'ocr',
+        textElements.push({
+          text: item.str,
+          x: Number(tx.toFixed(2)),
+          y: Number(topY.toFixed(2)),
+          width: Number(width.toFixed(2)),
+          height: Number((fontHeight * 1.2).toFixed(2)),
+          source: 'pdf-text',
         });
+        textLines.push(item.str);
       }
 
-      // Also include lines from OCR if available for multi-word phrase matching
-      const lines = ocrData.lines || [];
-      for (const ln of lines) {
-        const lineText = (ln.text || '').trim();
-        if (!lineText || !ln.bbox) continue;
-        const x = ln.bbox.x0 / ocrScale;
-        const y = ln.bbox.y0 / ocrScale;
-        const width = (ln.bbox.x1 - ln.bbox.x0) / ocrScale;
-        const height = (ln.bbox.y1 - ln.bbox.y0) / ocrScale;
-        ocrElements.push({
-          text: lineText,
-          x: Number(x.toFixed(2)),
-          y: Number(y.toFixed(2)),
-          width: Number(Math.max(width, 12).toFixed(2)),
-          height: Number(Math.max(height, 12).toFixed(2)),
-          source: 'ocr-line',
-        });
-      }
+      const joinedPdfText = textLines.join(' ').replace(/\s+/g, ' ').trim();
+      let pageMethod = 'pdf-text';
+      let finalPageText = joinedPdfText;
+      let finalElements = textElements;
 
-      if (joinedPdfText.length < 15) {
-        finalPageText = ocrText;
-        finalElements = ocrElements;
+      // Trigger OCR fallback if page has fewer than 15 characters of embedded text OR forceOcr is enabled
+      if (forceOcr || joinedPdfText.length < 15) {
+        usedOcrFallback = true;
+        pageMethod = joinedPdfText.length < 15 ? 'ocr-fallback' : 'hybrid';
+
+        const ocrScale = 2.0;
+        const { canvas } = await renderPageToCanvas(page, ocrScale);
+        const imageBuffer = canvas.toBuffer('image/png');
+
+        if (!ocrWorker) {
+          ocrWorker = await createWorker('eng');
+        }
+
+        // Request blocks: true so Tesseract.js v7 populates blocks -> paragraphs -> lines -> words with bboxes
+        const ocrResult = await ocrWorker.recognize(imageBuffer, {}, { blocks: true });
+        const ocrData = ocrResult?.data || {};
+        const ocrText = (ocrData.text || '').trim();
+
+        const ocrElements = extractOcrElementsFromData(ocrData, ocrScale);
+
+        if (joinedPdfText.length < 15) {
+          finalPageText = ocrText;
+          finalElements = ocrElements;
+        } else {
+          finalPageText = `${joinedPdfText}\n${ocrText}`.trim();
+          finalElements = [...textElements, ...ocrElements];
+          usedPdfText = true;
+        }
       } else {
-        finalPageText = `${joinedPdfText}\n${ocrText}`.trim();
-        finalElements = [...textElements, ...ocrElements];
         usedPdfText = true;
       }
-    } else {
-      usedPdfText = true;
-    }
 
-    pages.push({
-      pageNumber: pageNum,
-      width: Number(pageWidth.toFixed(2)),
-      height: Number(pageHeight.toFixed(2)),
-      method: pageMethod,
-      text: finalPageText,
-      elements: finalElements,
-    });
+      pages.push({
+        pageNumber: pageNum,
+        width: Number(pageWidth.toFixed(2)),
+        height: Number(pageHeight.toFixed(2)),
+        method: pageMethod,
+        text: finalPageText,
+        elements: finalElements,
+      });
+    }
+  } finally {
+    if (ocrWorker) {
+      try {
+        await ocrWorker.terminate();
+      } catch {
+        // Ensure worker termination errors never mask extraction results or failures
+      }
+    }
   }
 
   const totalCharacters = pages.reduce((acc, p) => acc + p.text.length, 0);

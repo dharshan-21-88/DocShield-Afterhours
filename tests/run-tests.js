@@ -1,19 +1,127 @@
 import assert from 'assert';
 import fs from 'fs';
+import { PDFDocument, StandardFonts, rgb } from 'pdf-lib';
+import { createCanvas } from '@napi-rs/canvas';
 import { createApp } from '../server.js';
 import { generateSamplePdfFile } from '../extraction/samples.js';
+import { extractPdfContent } from '../extraction/index.js';
+import { config } from '../config/index.js';
+import {
+  getDocumentRecord,
+  cleanupExpiredFiles,
+  safeDeleteFile,
+} from '../config/storage.js';
 
 /**
  * Automated End-to-End Test Suite for DocShield Backend
  *
- * Tests all 6 required hackathon scenarios:
- * 1. A text-based marks card containing fictional sensitive information.
- * 2. A scanned PDF requiring OCR (Tesseract.js fallback).
- * 3. A document containing multiple sensitive information categories.
- * 4. A document containing no detectable sensitive information.
- * 5. A corrupted or unsupported PDF.
- * 6. A PDF after redaction (both selective and automatic) to verify whether selected information remains detectable, plus SHA-256 report verification.
+ * Includes:
+ * - All original 6 hackathon scenarios & assertions (preserved intact)
+ * - 7 expanded test coverage scenarios (New Test 1 to New Test 7)
+ * - 5 Phase 1 Code Review Regression Tests (H-1, H-2, M-1 Email, M-1 Phone, L-1):
+ *   - [Regression Test H-1] Wrapped two-line address detection, per-line bounding boxes, and permanent redaction.
+ *   - [Regression Test H-2] Address where the city name also appears in the document header (prevent false header anchor).
+ *   - [Regression Test M-1A] The same email address appearing twice on one scanned page (both detected & both redacted).
+ *   - [Regression Test M-1B] The same phone number appearing twice on one scanned page (both detected & both redacted).
+ *   - [Regression Test L-1] OCR token substring collisions (prefer exact token match over earlier superstring token).
  */
+
+async function createMultiPageTestPdfBuffer() {
+  const pdfDoc = await PDFDocument.create();
+  pdfDoc.setTitle('FICTIONAL MULTI-PAGE ACADEMIC & FINANCIAL RECORD');
+  const fontBold = await pdfDoc.embedFont(StandardFonts.HelveticaBold);
+  const fontRegular = await pdfDoc.embedFont(StandardFonts.Helvetica);
+
+  // Page 1
+  const page1 = pdfDoc.addPage([595.28, 841.89]);
+  page1.drawText('PAGE 1: STUDENT ACADEMIC PROFILE (FICTIONAL)', {
+    x: 50,
+    y: 760,
+    size: 15,
+    font: fontBold,
+    color: rgb(0.1, 0.1, 0.2),
+  });
+  page1.drawText('Student Name: Kavya Menon (Synthetic Profile)', {
+    x: 50,
+    y: 720,
+    size: 12,
+    font: fontRegular,
+  });
+  page1.drawText('Student Registration No: REG-2026-MP-0101', {
+    x: 50,
+    y: 690,
+    size: 12,
+    font: fontRegular,
+  });
+  page1.drawText('University Email: kavya.menon.page1@fictional-univ.edu', {
+    x: 50,
+    y: 660,
+    size: 12,
+    font: fontRegular,
+  });
+
+  // Page 2
+  const page2 = pdfDoc.addPage([595.28, 841.89]);
+  page2.drawText('PAGE 2: SCHOLARSHIP DISBURSEMENT DETAILS (FICTIONAL)', {
+    x: 50,
+    y: 760,
+    size: 15,
+    font: fontBold,
+    color: rgb(0.1, 0.1, 0.2),
+  });
+  page2.drawText('Aadhaar / National ID: 5839 2019 4821', {
+    x: 50,
+    y: 720,
+    size: 12,
+    font: fontRegular,
+  });
+  page2.drawText('Contact Mobile: +91-9811122233', {
+    x: 50,
+    y: 690,
+    size: 12,
+    font: fontRegular,
+  });
+  page2.drawText('Bank IFSC Code: SBIN0009988', {
+    x: 50,
+    y: 660,
+    size: 12,
+    font: fontRegular,
+  });
+
+  return Buffer.from(await pdfDoc.save());
+}
+
+/**
+ * Helper to create an image-only (scanned OCR) PDF from an array of `{ text, x, y, font }` entries.
+ */
+async function createCustomScannedPdfBuffer(drawItems) {
+  const width = 1190;
+  const height = 1684;
+  const canvas = createCanvas(width, height);
+  const ctx = canvas.getContext('2d');
+
+  ctx.fillStyle = '#FFFFFF';
+  ctx.fillRect(0, 0, width, height);
+
+  ctx.fillStyle = '#000000';
+  for (const item of drawItems) {
+    ctx.font = item.font || '28px sans-serif';
+    ctx.fillText(item.text, item.x || 80, item.y);
+  }
+
+  const pngBuffer = canvas.toBuffer('image/png');
+  const pdfDoc = await PDFDocument.create();
+  const page = pdfDoc.addPage([595.28, 841.89]);
+  const pngImage = await pdfDoc.embedPng(pngBuffer);
+  page.drawImage(pngImage, {
+    x: 0,
+    y: 0,
+    width: 595.28,
+    height: 841.89,
+  });
+
+  return Buffer.from(await pdfDoc.save());
+}
 
 async function runTests() {
   console.log('================================================================');
@@ -25,198 +133,972 @@ async function runTests() {
   const address = server.address();
   const baseUrl = `http://127.0.0.1:${address.port}`;
 
-  try {
-    // 0. Health & Swagger OpenAPI specification check
-    console.log('▶ [Phase 1 Check] Testing GET /api/health and GET /api-docs...');
-    const healthRes = await fetch(`${baseUrl}/api/health`);
-    assert.strictEqual(healthRes.status, 200, 'Health endpoint should return 200');
-    const healthJson = await healthRes.json();
-    assert.strictEqual(healthJson.status, 'ok');
+  const createdSampleFiles = new Set();
+  const trackedDocumentIds = new Set();
 
-    const docsRes = await fetch(`${baseUrl}/api-docs/`);
-    assert.strictEqual(docsRes.status, 200, 'Swagger UI at /api-docs/ should return 200');
-    console.log('  ✅ Health check and Swagger UI (/api-docs) are operational.\n');
+  function trackDocId(docId) {
+    if (docId) trackedDocumentIds.add(docId);
+  }
 
-    // Helper for multipart file upload via fetch FormData
-    async function uploadSampleFile(sampleId) {
-      const sample = await generateSamplePdfFile(sampleId);
-      const buffer = await fs.promises.readFile(sample.filePath);
-      const formData = new FormData();
-      const blob = new Blob([buffer], { type: 'application/pdf' });
-      formData.append('file', blob, sample.fileName);
+  // Helper for multipart file upload via fetch FormData
+  async function uploadSampleFile(sampleId) {
+    const sample = await generateSamplePdfFile(sampleId);
+    createdSampleFiles.add(sample.filePath);
+    const buffer = await fs.promises.readFile(sample.filePath);
+    const formData = new FormData();
+    const blob = new Blob([buffer], { type: 'application/pdf' });
+    formData.append('file', blob, sample.fileName);
 
-      const res = await fetch(`${baseUrl}/api/upload`, {
-        method: 'POST',
-        body: formData,
-      });
-      const json = await res.json();
-      return { status: res.status, body: json };
+    const res = await fetch(`${baseUrl}/api/upload`, {
+      method: 'POST',
+      body: formData,
+    });
+    const json = await res.json();
+    if (json && json.documentId) {
+      trackDocId(json.documentId);
     }
+    return { status: res.status, body: json };
+  }
 
-    // TEST CASE 1: Text-based marks card containing fictional sensitive information
-    console.log('▶ [Test Case 1] Text-based Fictional Marks Card PDF...');
-    const tc1Upload = await uploadSampleFile('marks-card');
-    assert.strictEqual(tc1Upload.status, 201, 'Marks card upload should return 201');
-    assert.strictEqual(tc1Upload.body.extraction.extractionMethod, 'pdf-text');
-    const marksDocId = tc1Upload.body.documentId;
-
-    const tc1DetectRes = await fetch(`${baseUrl}/api/detect`, {
+  async function uploadCustomPdfBuffer(buffer, fileName) {
+    const formData = new FormData();
+    formData.append('file', new Blob([buffer], { type: 'application/pdf' }), fileName);
+    const res = await fetch(`${baseUrl}/api/upload`, {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ documentId: marksDocId }),
+      body: formData,
     });
-    const tc1Detect = await tc1DetectRes.json();
-    assert.strictEqual(tc1DetectRes.status, 200);
-    assert.ok(tc1Detect.totalDetected >= 4, `Expected >= 4 sensitive items in marks card, got ${tc1Detect.totalDetected}`);
-    console.log(`  ✅ Uploaded marks card (${marksDocId}) & detected ${tc1Detect.totalDetected} sensitive items:`, Object.keys(tc1Detect.categoryBreakdown).join(', '), '\n');
+    const json = await res.json();
+    if (json && json.documentId) {
+      trackDocId(json.documentId);
+    }
+    return { status: res.status, body: json };
+  }
 
-    // TEST CASE 2: Scanned PDF requiring OCR
-    console.log('▶ [Test Case 2] Scanned Image-Only PDF requiring Tesseract.js OCR Fallback...');
-    const tc2Upload = await uploadSampleFile('scanned-ocr');
-    assert.strictEqual(tc2Upload.status, 201, 'Scanned PDF upload should return 201');
-    assert.strictEqual(tc2Upload.body.extraction.usedOcrFallback, true, 'Scanned PDF must trigger OCR fallback');
-    assert.strictEqual(tc2Upload.body.extraction.extractionMethod, 'ocr-fallback');
+  // Shared state for original sequential tests where needed
+  let marksDocId = null;
+  let tc1Detect = null;
+  let scannedDocId = null;
+  let tc2Detect = null;
+  let multiCategoryDocId = null;
 
-    const tc2DetectRes = await fetch(`${baseUrl}/api/detect`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ documentId: tc2Upload.body.documentId }),
-    });
-    const tc2Detect = await tc2DetectRes.json();
-    assert.strictEqual(tc2DetectRes.status, 200);
-    assert.ok(tc2Detect.totalDetected >= 2, `Expected OCR detection to find sensitive items, found ${tc2Detect.totalDetected}`);
-    console.log(`  ✅ Scanned PDF triggered OCR fallback automatically and detected ${tc2Detect.totalDetected} items.\n`);
+  const testDefinitions = [
+    {
+      name: '[Phase 1 Check] GET /api/health and GET /api-docs',
+      fn: async () => {
+        const healthRes = await fetch(`${baseUrl}/api/health`);
+        assert.strictEqual(healthRes.status, 200, 'Health endpoint should return 200');
+        const healthJson = await healthRes.json();
+        assert.strictEqual(healthJson.status, 'ok');
 
-    // TEST CASE 3: Document containing multiple sensitive information categories
-    console.log('▶ [Test Case 3] Multi-Category Financial & Identity Document...');
-    const tc3Upload = await uploadSampleFile('multi-category');
-    assert.strictEqual(tc3Upload.status, 201);
-    const tc3DetectRes = await fetch(`${baseUrl}/api/detect`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ documentId: tc3Upload.body.documentId }),
-    });
-    const tc3Detect = await tc3DetectRes.json();
-    assert.ok(tc3Detect.totalDetected >= 6, `Expected >= 6 items across categories, got ${tc3Detect.totalDetected}`);
-    console.log(`  ✅ Multi-category document detected ${tc3Detect.totalDetected} items across categories:`, JSON.stringify(tc3Detect.categoryBreakdown), '\n');
+        const docsRes = await fetch(`${baseUrl}/api-docs/`);
+        assert.strictEqual(docsRes.status, 200, 'Swagger UI at /api-docs/ should return 200');
+      },
+    },
+    {
+      name: '[Test Case 1] Text-based Fictional Marks Card PDF Upload & Detection',
+      fn: async () => {
+        const tc1Upload = await uploadSampleFile('marks-card');
+        assert.strictEqual(tc1Upload.status, 201, 'Marks card upload should return 201');
+        assert.strictEqual(tc1Upload.body.extraction.extractionMethod, 'pdf-text');
+        marksDocId = tc1Upload.body.documentId;
 
-    // TEST CASE 4: Document containing no detectable sensitive information
-    console.log('▶ [Test Case 4] Clean Public Syllabus (No Sensitive Information)...');
-    const tc4Upload = await uploadSampleFile('clean-doc');
-    assert.strictEqual(tc4Upload.status, 201);
-    const tc4DetectRes = await fetch(`${baseUrl}/api/detect`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ documentId: tc4Upload.body.documentId }),
-    });
-    const tc4Detect = await tc4DetectRes.json();
-    assert.strictEqual(tc4Detect.totalDetected, 0, 'Clean syllabus should have 0 sensitive items');
-    console.log('  ✅ Clean document verified with 0 sensitive items detected.\n');
+        const tc1DetectRes = await fetch(`${baseUrl}/api/detect`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ documentId: marksDocId }),
+        });
+        tc1Detect = await tc1DetectRes.json();
+        assert.strictEqual(tc1DetectRes.status, 200);
+        assert.ok(
+          tc1Detect.totalDetected >= 4,
+          `Expected >= 4 sensitive items in marks card, got ${tc1Detect.totalDetected}`
+        );
+      },
+    },
+    {
+      name: '[Test Case 2] Scanned Image-Only PDF requiring Tesseract.js OCR Fallback',
+      fn: async () => {
+        const tc2Upload = await uploadSampleFile('scanned-ocr');
+        assert.strictEqual(tc2Upload.status, 201, 'Scanned PDF upload should return 201');
+        assert.strictEqual(tc2Upload.body.extraction.usedOcrFallback, true, 'Scanned PDF must trigger OCR fallback');
+        assert.strictEqual(tc2Upload.body.extraction.extractionMethod, 'ocr-fallback');
+        scannedDocId = tc2Upload.body.documentId;
 
-    // TEST CASE 5: Corrupted or unsupported PDF
-    console.log('▶ [Test Case 5] Corrupted PDF and Unsupported File Type Validation...');
-    const tc5Upload = await uploadSampleFile('corrupted-pdf');
-    assert.strictEqual(tc5Upload.status, 400, 'Corrupted PDF should return HTTP 400');
-    assert.strictEqual(tc5Upload.body.error, 'CORRUPTED_PDF');
+        const tc2DetectRes = await fetch(`${baseUrl}/api/detect`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ documentId: scannedDocId }),
+        });
+        tc2Detect = await tc2DetectRes.json();
+        assert.strictEqual(tc2DetectRes.status, 200);
+        assert.ok(
+          tc2Detect.totalDetected >= 2,
+          `Expected OCR detection to find sensitive items, found ${tc2Detect.totalDetected}`
+        );
+      },
+    },
+    {
+      name: '[Test Case 3] Multi-Category Financial & Identity Document Upload & Detection',
+      fn: async () => {
+        const tc3Upload = await uploadSampleFile('multi-category');
+        assert.strictEqual(tc3Upload.status, 201);
+        multiCategoryDocId = tc3Upload.body.documentId;
 
-    // Also test non-PDF file rejection
-    const badForm = new FormData();
-    badForm.append('file', new Blob(['hello world'], { type: 'text/plain' }), 'notes.txt');
-    const badRes = await fetch(`${baseUrl}/api/upload`, { method: 'POST', body: badForm });
-    assert.strictEqual(badRes.status, 400, 'Non-PDF file should return HTTP 400');
-    console.log('  ✅ Corrupted PDF and non-PDF file uploads rejected cleanly with HTTP 400.\n');
+        const tc3DetectRes = await fetch(`${baseUrl}/api/detect`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ documentId: multiCategoryDocId }),
+        });
+        const tc3Detect = await tc3DetectRes.json();
+        assert.ok(
+          tc3Detect.totalDetected >= 6,
+          `Expected >= 6 items across categories, got ${tc3Detect.totalDetected}`
+        );
+      },
+    },
+    {
+      name: '[Test Case 4] Clean Public Syllabus (No Sensitive Information)',
+      fn: async () => {
+        const tc4Upload = await uploadSampleFile('clean-doc');
+        assert.strictEqual(tc4Upload.status, 201);
+        const tc4DetectRes = await fetch(`${baseUrl}/api/detect`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ documentId: tc4Upload.body.documentId }),
+        });
+        const tc4Detect = await tc4DetectRes.json();
+        assert.strictEqual(tc4Detect.totalDetected, 0, 'Clean syllabus should have 0 sensitive items');
+      },
+    },
+    {
+      name: '[Test Case 5] Corrupted PDF and Unsupported File Type Validation',
+      fn: async () => {
+        const tc5Upload = await uploadSampleFile('corrupted-pdf');
+        assert.strictEqual(tc5Upload.status, 400, 'Corrupted PDF should return HTTP 400');
+        assert.strictEqual(tc5Upload.body.error, 'CORRUPTED_PDF');
 
-    // TEST CASE 6: Permanent Redaction (Selective + Automatic), Post-Redaction Verification, Report & SHA-256 Hash
-    console.log('▶ [Test Case 6A] Selective Redaction & Post-Redaction Verification...');
-    // Select only the first 2 items of the marks card so we verify that selected items are removed and unselected remain reported
-    const twoItemIds = tc1Detect.items.slice(0, 2).map((i) => i.id);
-    const selRedactRes = await fetch(`${baseUrl}/api/redact`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        documentId: marksDocId,
-        mode: 'selective',
-        selectedItemIds: twoItemIds,
-      }),
-    });
-    const selRedact = await selRedactRes.json();
-    assert.strictEqual(selRedactRes.status, 200);
-    assert.strictEqual(selRedact.selectedForRedactionCount, 2);
+        const badForm = new FormData();
+        badForm.append('file', new Blob(['hello world'], { type: 'text/plain' }), 'notes.txt');
+        const badRes = await fetch(`${baseUrl}/api/upload`, { method: 'POST', body: badForm });
+        assert.strictEqual(badRes.status, 400, 'Non-PDF file should return HTTP 400');
+      },
+    },
+    {
+      name: '[Test Case 6A] Selective Redaction & Post-Redaction Verification (Marks Card)',
+      fn: async () => {
+        assert.ok(marksDocId && tc1Detect, 'Marks card prerequisite must be available');
+        const twoItemIds = tc1Detect.items.slice(0, 2).map((i) => i.id);
+        const selRedactRes = await fetch(`${baseUrl}/api/redact`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            documentId: marksDocId,
+            mode: 'selective',
+            selectedItemIds: twoItemIds,
+          }),
+        });
+        const selRedact = await selRedactRes.json();
+        assert.strictEqual(selRedactRes.status, 200);
+        assert.strictEqual(selRedact.selectedForRedactionCount, 2);
 
-    const selVerifyRes = await fetch(`${baseUrl}/api/verify`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        documentId: marksDocId,
-        runOcrCheck: true,
-      }),
-    });
-    const selVerify = await selVerifyRes.json();
-    assert.strictEqual(selVerifyRes.status, 200);
-    assert.strictEqual(
-      selVerify.verification.successfullyRemovedCount,
-      2,
-      'Both selected items must be permanently removed'
-    );
-    assert.ok(
-      selVerify.verification.remainingUnselectedDetectableCount >= 1,
-      'Unselected items should remain detectable and reported'
-    );
-    console.log(
-      `  ✅ Selective Redaction verified: ${selVerify.verification.successfullyRemovedCount}/2 selected items permanently removed; ${selVerify.verification.remainingUnselectedDetectableCount} unselected items accurately flagged as still exposed.\n`
-    );
+        const selVerifyRes = await fetch(`${baseUrl}/api/verify`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            documentId: marksDocId,
+            runOcrCheck: true,
+          }),
+        });
+        const selVerify = await selVerifyRes.json();
+        assert.strictEqual(selVerifyRes.status, 200);
+        assert.strictEqual(
+          selVerify.verification.successfullyRemovedCount,
+          2,
+          'Both selected items must be permanently removed'
+        );
+        assert.ok(
+          selVerify.verification.remainingUnselectedDetectableCount >= 1,
+          'Unselected items should remain detectable and reported'
+        );
+      },
+    },
+    {
+      name: '[Test Case 6B] Automatic Full Redaction, Verification, Download & Privacy Report (SHA-256)',
+      fn: async () => {
+        assert.ok(marksDocId, 'Marks card prerequisite must be available');
+        const autoRedactRes = await fetch(`${baseUrl}/api/redact`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            documentId: marksDocId,
+            mode: 'automatic',
+          }),
+        });
+        const autoRedact = await autoRedactRes.json();
+        assert.strictEqual(autoRedactRes.status, 200);
+        assert.ok(
+          autoRedact.redactedPdfSha256 && autoRedact.redactedPdfSha256.length === 64,
+          'Must return 64-char SHA-256 hex'
+        );
 
-    console.log('▶ [Test Case 6B] Automatic Full Redaction, Verification, Download & Privacy Report (SHA-256)...');
-    const autoRedactRes = await fetch(`${baseUrl}/api/redact`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        documentId: marksDocId,
-        mode: 'automatic',
-      }),
-    });
-    const autoRedact = await autoRedactRes.json();
-    assert.strictEqual(autoRedactRes.status, 200);
-    assert.ok(autoRedact.redactedPdfSha256 && autoRedact.redactedPdfSha256.length === 64, 'Must return 64-char SHA-256 hex');
+        const autoVerifyRes = await fetch(`${baseUrl}/api/verify`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            documentId: marksDocId,
+            runOcrCheck: true,
+          }),
+        });
+        const autoVerify = await autoVerifyRes.json();
+        assert.strictEqual(autoVerifyRes.status, 200);
+        assert.strictEqual(
+          autoVerify.verification.selectedStillDetectableCount,
+          0,
+          '0 selected items should remain detectable after automatic redaction'
+        );
 
-    const autoVerifyRes = await fetch(`${baseUrl}/api/verify`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        documentId: marksDocId,
-        runOcrCheck: true,
-      }),
-    });
-    const autoVerify = await autoVerifyRes.json();
-    assert.strictEqual(autoVerifyRes.status, 200);
-    assert.strictEqual(
-      autoVerify.verification.selectedStillDetectableCount,
-      0,
-      '0 selected items should remain detectable after automatic redaction'
-    );
+        const reportRes = await fetch(`${baseUrl}/api/report/${autoVerify.reportId}`);
+        const reportJson = await reportRes.json();
+        assert.strictEqual(reportRes.status, 200);
+        assert.strictEqual(
+          reportJson.report.exportedDocumentIntegrity.sha256,
+          autoRedact.redactedPdfSha256
+        );
 
-    // Retrieve privacy assessment report via GET /api/report/:id
-    const reportRes = await fetch(`${baseUrl}/api/report/${autoVerify.reportId}`);
-    const reportJson = await reportRes.json();
-    assert.strictEqual(reportRes.status, 200);
-    assert.strictEqual(reportJson.report.exportedDocumentIntegrity.sha256, autoRedact.redactedPdfSha256);
+        const downloadRes = await fetch(`${baseUrl}/api/download/${marksDocId}`);
+        assert.strictEqual(downloadRes.status, 200);
+        assert.strictEqual(downloadRes.headers.get('x-document-sha256'), autoRedact.redactedPdfSha256);
+      },
+    },
 
-    // Download the protected PDF via GET /api/download/:documentId
-    const downloadRes = await fetch(`${baseUrl}/api/download/${marksDocId}`);
-    assert.strictEqual(downloadRes.status, 200);
-    assert.strictEqual(downloadRes.headers.get('x-document-sha256'), autoRedact.redactedPdfSha256);
-    console.log(`  ✅ Full Redaction & Verification passed! Report ID: ${autoVerify.reportId}`);
-    console.log(`  ✅ Exported PDF SHA-256: ${autoRedact.redactedPdfSha256}\n`);
+    // =========================================================================
+    // EXPANDED TEST SCENARIOS (1 through 7)
+    // =========================================================================
+    {
+      name: '[New Test 1] Complete Redaction & Post-Redaction Verification of Scanned OCR-Only PDF',
+      fn: async () => {
+        const scanUpload = await uploadSampleFile('scanned-ocr');
+        assert.strictEqual(scanUpload.status, 201);
+        const docId = scanUpload.body.documentId;
 
-    console.log('================================================================');
-    console.log('🎉 ALL 6 DOCSHIELD HACKATHON TEST CASES PASSED SUCCESSFULLY!');
-    console.log('================================================================');
+        const detectRes = await fetch(`${baseUrl}/api/detect`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ documentId: docId }),
+        });
+        const detectJson = await detectRes.json();
+        assert.strictEqual(detectRes.status, 200);
+        assert.ok(detectJson.totalDetected >= 2, 'Scanned PDF should have >= 2 detected items before redaction');
+
+        const redactRes = await fetch(`${baseUrl}/api/redact`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            documentId: docId,
+            mode: 'automatic',
+          }),
+        });
+        const redactJson = await redactRes.json();
+        assert.strictEqual(redactRes.status, 200, 'Scanned PDF redaction should return HTTP 200');
+        assert.strictEqual(
+          redactJson.selectedForRedactionCount,
+          detectJson.totalDetected,
+          'Automatic redaction on scanned PDF should select all detected items'
+        );
+
+        const verifyRes = await fetch(`${baseUrl}/api/verify`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            documentId: docId,
+            runOcrCheck: true,
+          }),
+        });
+        const verifyJson = await verifyRes.json();
+        assert.strictEqual(verifyRes.status, 200, 'Scanned PDF verification should return HTTP 200');
+
+        assert.strictEqual(
+          verifyJson.verification.selectedStillDetectableCount,
+          0,
+          `Expected 0 selected items to remain detectable in redacted scanned PDF, but ${
+            verifyJson.verification.selectedStillDetectableCount
+          } item(s) were still detected via OCR: ${JSON.stringify(
+            verifyJson.verification.selectedStillDetectable.map((i) => ({
+              id: i.id,
+              text: i.text,
+              boundingBox: i.boundingBox,
+            }))
+          )}`
+        );
+        assert.strictEqual(
+          verifyJson.verification.successfullyRemovedCount,
+          detectJson.totalDetected,
+          'All selected items on the scanned PDF must be verified as removed'
+        );
+      },
+    },
+    {
+      name: '[New Test 2] Multi-Page PDF Extraction, Detection, Redaction & Verification',
+      fn: async () => {
+        const multiPageBuffer = await createMultiPageTestPdfBuffer();
+        const uploadRes = await uploadCustomPdfBuffer(multiPageBuffer, 'fictional_multipage.pdf');
+        assert.strictEqual(uploadRes.status, 201, 'Multi-page upload should return HTTP 201');
+        const uploadJson = uploadRes.body;
+        assert.strictEqual(uploadJson.extraction.pageCount, 2, 'Page count must be 2');
+        assert.strictEqual(uploadJson.extraction.pages.length, 2, 'Pages array must contain 2 pages');
+
+        const detectRes = await fetch(`${baseUrl}/api/detect`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ documentId: uploadJson.documentId }),
+        });
+        const detectJson = await detectRes.json();
+        assert.strictEqual(detectRes.status, 200);
+        const page1Items = detectJson.items.filter((i) => i.pageNumber === 1);
+        const page2Items = detectJson.items.filter((i) => i.pageNumber === 2);
+        assert.ok(page1Items.length >= 2, `Expected >= 2 items on Page 1, got ${page1Items.length}`);
+        assert.ok(page2Items.length >= 2, `Expected >= 2 items on Page 2, got ${page2Items.length}`);
+
+        const redactRes = await fetch(`${baseUrl}/api/redact`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            documentId: uploadJson.documentId,
+            mode: 'automatic',
+          }),
+        });
+        const redactJson = await redactRes.json();
+        assert.strictEqual(redactRes.status, 200);
+        assert.strictEqual(redactJson.selectedForRedactionCount, detectJson.totalDetected);
+
+        const verifyRes = await fetch(`${baseUrl}/api/verify`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            documentId: uploadJson.documentId,
+            runOcrCheck: true,
+          }),
+        });
+        const verifyJson = await verifyRes.json();
+        assert.strictEqual(verifyRes.status, 200);
+        assert.strictEqual(verifyJson.verification.postExtractionSummary.pageCount, 2);
+        assert.strictEqual(
+          verifyJson.verification.selectedStillDetectableCount,
+          0,
+          `Expected 0 items remaining on multi-page PDF after redaction, found ${verifyJson.verification.selectedStillDetectableCount}`
+        );
+      },
+    },
+    {
+      name: '[New Test 3A] Upload Validation: Missing File Field',
+      fn: async () => {
+        const emptyForm = new FormData();
+        const res = await fetch(`${baseUrl}/api/upload`, {
+          method: 'POST',
+          body: emptyForm,
+        });
+        const body = await res.json();
+        assert.strictEqual(res.status, 400, 'Missing file should return HTTP 400');
+        assert.strictEqual(body.error, 'MISSING_FILE');
+      },
+    },
+    {
+      name: '[New Test 3B] Upload Validation: Empty 0-Byte PDF File',
+      fn: async () => {
+        const form = new FormData();
+        form.append('file', new Blob([], { type: 'application/pdf' }), 'empty_zero_byte.pdf');
+        const res = await fetch(`${baseUrl}/api/upload`, {
+          method: 'POST',
+          body: form,
+        });
+        const body = await res.json();
+        assert.strictEqual(res.status, 400, 'Empty 0-byte PDF should return HTTP 400');
+        assert.strictEqual(body.error, 'EMPTY_FILE');
+      },
+    },
+    {
+      name: '[New Test 3C] Upload Validation: Invalid PDF Magic Header (%PDF- missing)',
+      fn: async () => {
+        const form = new FormData();
+        form.append(
+          'file',
+          new Blob(['THIS_IS_NOT_A_VALID_PDF_HEADER_12345'], { type: 'application/pdf' }),
+          'fake_header.pdf'
+        );
+        const res = await fetch(`${baseUrl}/api/upload`, {
+          method: 'POST',
+          body: form,
+        });
+        const body = await res.json();
+        assert.strictEqual(res.status, 400, 'File without %PDF- header should return HTTP 400');
+        assert.strictEqual(body.error, 'INVALID_PDF_HEADER');
+      },
+    },
+    {
+      name: '[New Test 3D] Upload Validation: File Exceeding Configured Size Limit (> 10 MB)',
+      fn: async () => {
+        const oversizedBuffer = Buffer.alloc(config.upload.maxFileSizeBytes + 2048, 0x41);
+        oversizedBuffer.write('%PDF-1.7\n', 0, 'ascii');
+
+        const form = new FormData();
+        form.append('file', new Blob([oversizedBuffer], { type: 'application/pdf' }), 'oversized_10mb.pdf');
+        const res = await fetch(`${baseUrl}/api/upload`, {
+          method: 'POST',
+          body: form,
+        });
+        const body = await res.json();
+        assert.strictEqual(res.status, 413, 'Oversized PDF should return HTTP 413');
+        assert.strictEqual(body.error, 'FILE_TOO_LARGE');
+      },
+    },
+    {
+      name: '[New Test 4] Detection Category Filtering',
+      fn: async () => {
+        let docId = multiCategoryDocId;
+        if (!docId) {
+          const up = await uploadSampleFile('multi-category');
+          docId = up.body.documentId;
+        }
+
+        const requestedCategories = ['EMAIL_ADDRESS', 'FINANCIAL_ACCOUNT'];
+        const res = await fetch(`${baseUrl}/api/detect`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            documentId: docId,
+            categories: requestedCategories,
+          }),
+        });
+        const body = await res.json();
+        assert.strictEqual(res.status, 200);
+        assert.ok(body.totalDetected >= 2, 'Filtered detection should find EMAIL_ADDRESS and FINANCIAL_ACCOUNT items');
+
+        for (const item of body.items) {
+          assert.ok(
+            requestedCategories.includes(item.category),
+            `Unexpected category "${item.category}" returned when filtering for ${requestedCategories.join(', ')}`
+          );
+        }
+
+        const breakdownKeys = Object.keys(body.categoryBreakdown);
+        for (const k of breakdownKeys) {
+          assert.ok(
+            requestedCategories.includes(k),
+            `Unexpected category key "${k}" in categoryBreakdown`
+          );
+        }
+      },
+    },
+    {
+      name: '[New Test 5] Sample Listing (GET /api/samples) & Sample-Loading API Endpoints',
+      fn: async () => {
+        const listRes = await fetch(`${baseUrl}/api/samples`);
+        const listBody = await listRes.json();
+        assert.strictEqual(listRes.status, 200);
+        assert.strictEqual(listBody.success, true);
+        assert.ok(Array.isArray(listBody.samples) && listBody.samples.length === 5);
+
+        const loadValidRes = await fetch(`${baseUrl}/api/samples/marks-card/load`, {
+          method: 'POST',
+        });
+        const loadValidBody = await loadValidRes.json();
+        assert.strictEqual(loadValidRes.status, 201);
+        assert.strictEqual(loadValidBody.success, true);
+        assert.strictEqual(loadValidBody.sampleId, 'marks-card');
+        assert.ok(loadValidBody.documentId);
+        trackDocId(loadValidBody.documentId);
+
+        const loadCorruptRes = await fetch(`${baseUrl}/api/samples/corrupted-pdf/load`, {
+          method: 'POST',
+        });
+        const loadCorruptBody = await loadCorruptRes.json();
+        assert.strictEqual(loadCorruptRes.status, 400);
+        assert.strictEqual(loadCorruptBody.error, 'CORRUPTED_PDF');
+
+        const loadUnknownRes = await fetch(`${baseUrl}/api/samples/non-existent-sample/load`, {
+          method: 'POST',
+        });
+        const loadUnknownBody = await loadUnknownRes.json();
+        assert.strictEqual(loadUnknownRes.status, 400);
+        assert.strictEqual(loadUnknownBody.error, 'INVALID_SAMPLE_ID');
+      },
+    },
+    {
+      name: '[New Test 6] Invalid Document IDs & Invalid Redaction / Verification / Report Requests',
+      fn: async () => {
+        for (const endpoint of ['/api/detect', '/api/redact', '/api/verify']) {
+          const res = await fetch(`${baseUrl}${endpoint}`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({}),
+          });
+          const body = await res.json();
+          assert.strictEqual(res.status, 400, `${endpoint} without documentId should return 400`);
+          assert.strictEqual(body.error, 'MISSING_DOCUMENT_ID');
+        }
+
+        for (const endpoint of ['/api/detect', '/api/redact', '/api/verify']) {
+          const res = await fetch(`${baseUrl}${endpoint}`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ documentId: 'doc_does_not_exist_999999' }),
+          });
+          const body = await res.json();
+          assert.strictEqual(res.status, 404, `${endpoint} with unknown documentId should return 404`);
+          assert.strictEqual(body.error, 'DOCUMENT_NOT_FOUND');
+        }
+
+        const freshRes = await fetch(`${baseUrl}/api/samples/clean-doc/load`, { method: 'POST' });
+        const freshDoc = await freshRes.json();
+        trackDocId(freshDoc.documentId);
+
+        const badModeRes = await fetch(`${baseUrl}/api/redact`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ documentId: freshDoc.documentId, mode: 'unsupported_mode' }),
+        });
+        const badModeBody = await badModeRes.json();
+        assert.strictEqual(badModeRes.status, 400);
+        assert.strictEqual(badModeBody.error, 'INVALID_REDACTION_MODE');
+
+        const noItemsRes = await fetch(`${baseUrl}/api/redact`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ documentId: freshDoc.documentId, mode: 'selective' }),
+        });
+        const noItemsBody = await noItemsRes.json();
+        assert.strictEqual(noItemsRes.status, 400);
+        assert.strictEqual(noItemsBody.error, 'MISSING_SELECTED_ITEMS');
+
+        const verifyEarlyRes = await fetch(`${baseUrl}/api/verify`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ documentId: freshDoc.documentId }),
+        });
+        const verifyEarlyBody = await verifyEarlyRes.json();
+        assert.strictEqual(verifyEarlyRes.status, 400);
+        assert.strictEqual(verifyEarlyBody.error, 'REDACTED_PDF_NOT_READY');
+
+        const repRes = await fetch(`${baseUrl}/api/report/rep_does_not_exist_999999`);
+        const repBody = await repRes.json();
+        assert.strictEqual(repRes.status, 404);
+        assert.strictEqual(repBody.error, 'REPORT_NOT_FOUND');
+
+        const dlRes = await fetch(`${baseUrl}/api/download/doc_does_not_exist_999999`);
+        const dlBody = await dlRes.json();
+        assert.strictEqual(dlRes.status, 404);
+        assert.strictEqual(dlBody.error, 'REDACTED_FILE_NOT_FOUND');
+      },
+    },
+    {
+      name: '[New Test 7] Temporary File Cleanup (cleanupExpiredFiles)',
+      fn: async () => {
+        const originalRetention = config.upload.fileRetentionMs;
+        try {
+          const loadRes = await fetch(`${baseUrl}/api/samples/clean-doc/load`, { method: 'POST' });
+          const loadBody = await loadRes.json();
+          assert.strictEqual(loadRes.status, 201);
+          const docId = loadBody.documentId;
+          trackDocId(docId);
+
+          const redactRes = await fetch(`${baseUrl}/api/redact`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ documentId: docId, mode: 'automatic' }),
+          });
+          assert.strictEqual(redactRes.status, 200);
+
+          const recordBefore = getDocumentRecord(docId);
+          assert.ok(recordBefore, 'Document record must exist before cleanup');
+          const origPath = recordBefore.originalFilePath;
+          const redPath = recordBefore.redactedFilePath;
+          assert.strictEqual(fs.existsSync(origPath), true, 'Original temp file must exist on disk');
+          assert.strictEqual(fs.existsSync(redPath), true, 'Redacted temp file must exist on disk');
+
+          recordBefore.updatedAt = Date.now() - originalRetention - 10000;
+
+          await cleanupExpiredFiles();
+
+          const recordAfter = getDocumentRecord(docId);
+          assert.strictEqual(recordAfter, null, 'Expired document record must be removed from memory');
+          assert.strictEqual(fs.existsSync(origPath), false, 'Expired original PDF must be deleted from disk');
+          assert.strictEqual(fs.existsSync(redPath), false, 'Expired redacted PDF must be deleted from disk');
+        } finally {
+          config.upload.fileRetentionMs = originalRetention;
+        }
+      },
+    },
+
+    // =========================================================================
+    // PHASE 1 CODE REVIEW REGRESSION TESTS (H-1, H-2, M-1A, M-1B, L-1)
+    // =========================================================================
+    {
+      name: '[Regression Test H-1] Wrapped Two-Line Address Complete Multi-Line Coverage & Redaction',
+      fn: async () => {
+        // Create a scanned PDF where the address wraps across two distinct vertical lines:
+        // Line 1 (y = 260px -> ~130pt): "No. 42, MG Road, Indiranagar,"
+        // Line 2 (y = 330px -> ~165pt): "Bengaluru - 560038"
+        const scannedWrappedBuf = await createCustomScannedPdfBuffer([
+          { text: 'STUDENT RESIDENCE VERIFICATION FORM (FICTIONAL)', x: 80, y: 120, font: 'bold 32px sans-serif' },
+          { text: 'Candidate Name: Siddharth Rao', x: 80, y: 195, font: '28px sans-serif' },
+          { text: 'No. 42, MG Road, Indiranagar,', x: 80, y: 265, font: '28px sans-serif' },
+          { text: 'Bengaluru - 560038', x: 80, y: 335, font: '28px sans-serif' },
+          { text: 'Department: Computer Science', x: 80, y: 420, font: '28px sans-serif' },
+        ]);
+
+        const up = await uploadCustomPdfBuffer(scannedWrappedBuf, 'wrapped_address_scan.pdf');
+        assert.strictEqual(up.status, 201);
+        const docId = up.body.documentId;
+
+        const detRes = await fetch(`${baseUrl}/api/detect`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ documentId: docId, categories: ['ADDRESS'] }),
+        });
+        const detBody = await detRes.json();
+        assert.strictEqual(detRes.status, 200);
+        assert.strictEqual(detBody.totalDetected, 1, 'Must detect the wrapped two-line address');
+
+        const addrItem = detBody.items[0];
+        assert.ok(addrItem.boundingBox, 'Wrapped address must have a valid primary boundingBox');
+        assert.ok(
+          Array.isArray(addrItem.boundingBoxes) && addrItem.boundingBoxes.length === 2,
+          `Wrapped two-line address must produce 2 per-line boundingBoxes, got: ${JSON.stringify(addrItem.boundingBoxes)}`
+        );
+
+        // Redact & verify that NEITHER Line 1 ("Indiranagar") NOR Line 2 ("560038") remains readable via OCR
+        const redRes = await fetch(`${baseUrl}/api/redact`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ documentId: docId, mode: 'automatic' }),
+        });
+        assert.strictEqual(redRes.status, 200);
+
+        const rec = getDocumentRecord(docId);
+        const postOcr = await extractPdfContent(rec.redactedFilePath, { forceOcr: true });
+        const afterText = postOcr.pages[0].text.toLowerCase();
+
+        assert.strictEqual(
+          afterText.includes('indiranagar'),
+          false,
+          `Line 1 of wrapped address ("Indiranagar") must be masked, but OCR read: ${afterText}`
+        );
+        assert.strictEqual(
+          afterText.includes('560038'),
+          false,
+          `Line 2 of wrapped address ("560038") must be masked, but OCR read: ${afterText}`
+        );
+        assert.strictEqual(
+          afterText.includes('siddharth'),
+          true,
+          'Unrelated candidate name line must remain unredacted and readable'
+        );
+      },
+    },
+    {
+      name: '[Regression Test H-2] Address Where City Name Also Appears in Document Header (Anchor Accuracy)',
+      fn: async () => {
+        // Header at y = 110px (~55pt) contains "BENGALURU" and "ROAD"
+        // Actual address is near bottom at y = 520px (~260pt)
+        const headerCollisionBuf = await createCustomScannedPdfBuffer([
+          { text: 'BENGALURU REGIONAL CAMPUS - MG ROAD OFFICE', x: 80, y: 110, font: 'bold 32px sans-serif' },
+          { text: 'Official Academic Transcript Verification', x: 80, y: 185, font: '28px sans-serif' },
+          { text: 'Student Name: Ananya Kulkarni', x: 80, y: 260, font: '28px sans-serif' },
+          { text: 'Address: No. 42, MG Road, Bengaluru - 560001', x: 80, y: 520, font: '28px sans-serif' },
+        ]);
+
+        const up = await uploadCustomPdfBuffer(headerCollisionBuf, 'header_city_collision.pdf');
+        assert.strictEqual(up.status, 201);
+        const docId = up.body.documentId;
+
+        const detRes = await fetch(`${baseUrl}/api/detect`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ documentId: docId, categories: ['ADDRESS'] }),
+        });
+        const detBody = await detRes.json();
+        assert.strictEqual(detRes.status, 200);
+        assert.strictEqual(detBody.totalDetected, 1);
+
+        const addrItem = detBody.items[0];
+        assert.ok(addrItem.boundingBox, 'Address must have a boundingBox');
+        // Header is at ~55pt (110px / 2); Address is at ~250pt (520px / 2).
+        assert.ok(
+          addrItem.boundingBox.y > 200,
+          `Address boundingBox.y (${addrItem.boundingBox.y}) must be anchored at the address line (~250pt), NOT the header (~55pt)`
+        );
+
+        const redRes = await fetch(`${baseUrl}/api/redact`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ documentId: docId, mode: 'automatic' }),
+        });
+        assert.strictEqual(redRes.status, 200);
+
+        const verRes = await fetch(`${baseUrl}/api/verify`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ documentId: docId, runOcrCheck: true }),
+        });
+        const verBody = await verRes.json();
+        assert.strictEqual(verRes.status, 200);
+        assert.strictEqual(verBody.verification.selectedStillDetectableCount, 0, 'Address at bottom must be redacted');
+
+        const rec = getDocumentRecord(docId);
+        const postOcr = await extractPdfContent(rec.redactedFilePath, { forceOcr: true });
+        const afterText = postOcr.pages[0].text.toLowerCase();
+        assert.strictEqual(
+          afterText.includes('regional campus'),
+          true,
+          'Document header must remain unredacted'
+        );
+        assert.strictEqual(
+          afterText.includes('560001'),
+          false,
+          'Address PIN code must be completely masked'
+        );
+      },
+    },
+    {
+      name: '[Regression Test M-1A] Duplicate Email Appearing Twice on One Scanned Page',
+      fn: async () => {
+        const dupEmail = 'duplicate.student@example.edu';
+        const scannedDupEmailBuf = await createCustomScannedPdfBuffer([
+          { text: 'DUPLICATE EMAIL VERIFICATION SLIP (FICTIONAL)', x: 80, y: 120, font: 'bold 32px sans-serif' },
+          { text: `Primary Contact Email: ${dupEmail}`, x: 80, y: 240, font: '28px sans-serif' },
+          { text: 'Intermediate Section: Academic Clearance Approved', x: 80, y: 360, font: '28px sans-serif' },
+          { text: `Secondary Copy Email: ${dupEmail}`, x: 80, y: 480, font: '28px sans-serif' },
+        ]);
+
+        const up = await uploadCustomPdfBuffer(scannedDupEmailBuf, 'dup_email_scan.pdf');
+        assert.strictEqual(up.status, 201);
+        const docId = up.body.documentId;
+
+        const detRes = await fetch(`${baseUrl}/api/detect`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ documentId: docId, categories: ['EMAIL_ADDRESS'] }),
+        });
+        const detBody = await detRes.json();
+        assert.strictEqual(detRes.status, 200);
+        assert.strictEqual(
+          detBody.totalDetected,
+          2,
+          `Expected both occurrences of ${dupEmail} to be detected, got ${detBody.totalDetected}`
+        );
+
+        const box1 = detBody.items[0].boundingBox;
+        const box2 = detBody.items[1].boundingBox;
+        assert.ok(box1 && box2, 'Both email occurrences must have non-null bounding boxes');
+        assert.ok(
+          Math.abs(box2.y - box1.y) > 80,
+          `The two email bounding boxes must have distinct vertical coordinates (y1=${box1.y}, y2=${box2.y})`
+        );
+
+        const redRes = await fetch(`${baseUrl}/api/redact`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ documentId: docId, mode: 'automatic' }),
+        });
+        assert.strictEqual(redRes.status, 200);
+
+        const verRes = await fetch(`${baseUrl}/api/verify`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ documentId: docId, runOcrCheck: true }),
+        });
+        const verBody = await verRes.json();
+        assert.strictEqual(verRes.status, 200);
+        assert.strictEqual(
+          verBody.verification.selectedStillDetectableCount,
+          0,
+          'Neither occurrence of the duplicate email may remain detectable after redaction'
+        );
+        assert.strictEqual(verBody.verification.successfullyRemovedCount, 2);
+      },
+    },
+    {
+      name: '[Regression Test M-1B] Duplicate Phone Number Appearing Twice on One Scanned Page',
+      fn: async () => {
+        const dupPhone = '+91 9876543210';
+        const scannedDupPhoneBuf = await createCustomScannedPdfBuffer([
+          { text: 'DUPLICATE PHONE VERIFICATION SLIP (FICTIONAL)', x: 80, y: 120, font: 'bold 32px sans-serif' },
+          { text: `Applicant Mobile: ${dupPhone}`, x: 80, y: 240, font: '28px sans-serif' },
+          { text: 'Intermediate Note: Emergency Contact Same As Applicant', x: 80, y: 360, font: '28px sans-serif' },
+          { text: `Emergency Mobile: ${dupPhone}`, x: 80, y: 480, font: '28px sans-serif' },
+        ]);
+
+        const up = await uploadCustomPdfBuffer(scannedDupPhoneBuf, 'dup_phone_scan.pdf');
+        assert.strictEqual(up.status, 201);
+        const docId = up.body.documentId;
+
+        const detRes = await fetch(`${baseUrl}/api/detect`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ documentId: docId, categories: ['PHONE_NUMBER'] }),
+        });
+        const detBody = await detRes.json();
+        assert.strictEqual(detRes.status, 200);
+        assert.strictEqual(
+          detBody.totalDetected,
+          2,
+          `Expected both occurrences of ${dupPhone} to be detected, got ${detBody.totalDetected}`
+        );
+
+        const box1 = detBody.items[0].boundingBox;
+        const box2 = detBody.items[1].boundingBox;
+        assert.ok(box1 && box2, 'Both phone occurrences must have non-null bounding boxes');
+        assert.ok(
+          Math.abs(box2.y - box1.y) > 80,
+          `The two phone bounding boxes must have distinct vertical coordinates (y1=${box1.y}, y2=${box2.y})`
+        );
+
+        const redRes = await fetch(`${baseUrl}/api/redact`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ documentId: docId, mode: 'automatic' }),
+        });
+        assert.strictEqual(redRes.status, 200);
+
+        const verRes = await fetch(`${baseUrl}/api/verify`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ documentId: docId, runOcrCheck: true }),
+        });
+        const verBody = await verRes.json();
+        assert.strictEqual(verRes.status, 200);
+        assert.strictEqual(
+          verBody.verification.selectedStillDetectableCount,
+          0,
+          'Neither occurrence of the duplicate phone number may remain detectable after redaction'
+        );
+        assert.strictEqual(verBody.verification.successfullyRemovedCount, 2);
+      },
+    },
+    {
+      name: '[Regression Test L-1] OCR Token Substring Collision (Exact Token Match Preferred Over Superstring)',
+      fn: async () => {
+        // Top of page (y = 210px -> ~105pt) has non-sensitive reference tokens that are superstrings of the individual
+        // Aadhaar words ("REF4829X", "CODE7301Y", "BATCH9482Z"), while the actual standalone Aadhaar "4829 7301 9482"
+        // is at y = 460px (~230pt).
+        // Under the old Strategy 1 (`wNorm.includes(tNorm)`), the 3 contiguous superstring words at y = 210px
+        // would falsely match `["4829", "7301", "9482"]` on the first pass!
+        const collisionBuf = await createCustomScannedPdfBuffer([
+          { text: 'OCR SUBSTRING COLLISION TEST (FICTIONAL)', x: 80, y: 110, font: 'bold 32px sans-serif' },
+          { text: 'Batch Reference Codes: REF-4829-X CODE-7301-Y BATCH-9482-Z', x: 80, y: 210, font: '28px sans-serif' },
+          { text: 'National ID No: 4829 7301 9482', x: 80, y: 460, font: '28px sans-serif' },
+        ]);
+
+        const up = await uploadCustomPdfBuffer(collisionBuf, 'ocr_substring_collision.pdf');
+        assert.strictEqual(up.status, 201);
+        const docId = up.body.documentId;
+
+        const detRes = await fetch(`${baseUrl}/api/detect`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ documentId: docId, categories: ['NATIONAL_ID_AADHAAR'] }),
+        });
+        const detBody = await detRes.json();
+        assert.strictEqual(detRes.status, 200);
+        assert.strictEqual(detBody.totalDetected, 1);
+
+        const idItem = detBody.items[0];
+        assert.strictEqual(idItem.text, '4829 7301 9482');
+        assert.ok(idItem.boundingBox, 'Aadhaar item must have a valid boundingBox');
+        // Superstring tokens are at y ≈ 95pt (210px / 2); actual Aadhaar is at y ≈ 220pt (460px / 2)
+        assert.ok(
+          idItem.boundingBox.y > 180,
+          `Aadhaar boundingBox.y (${idItem.boundingBox.y}) must match the exact tokens at ~220pt, not the superstring tokens at ~95pt`
+        );
+
+        const redRes = await fetch(`${baseUrl}/api/redact`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ documentId: docId, mode: 'automatic' }),
+        });
+        assert.strictEqual(redRes.status, 200);
+
+        const verRes = await fetch(`${baseUrl}/api/verify`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ documentId: docId, runOcrCheck: true }),
+        });
+        const verBody = await verRes.json();
+        assert.strictEqual(verRes.status, 200);
+        assert.strictEqual(verBody.verification.selectedStillDetectableCount, 0);
+      },
+    },
+  ];
+
+  const results = testDefinitions.map((t) => ({
+    name: t.name,
+    status: 'NOT_EXECUTED',
+    error: null,
+  }));
+
+  try {
+    for (let i = 0; i < testDefinitions.length; i++) {
+      const def = testDefinitions[i];
+      console.log(`▶ Running: ${def.name}...`);
+      try {
+        await def.fn();
+        results[i].status = 'PASSED';
+        console.log(`  ✅ PASSED: ${def.name}\n`);
+      } catch (err) {
+        results[i].status = 'FAILED';
+        results[i].error = err;
+        console.error(`  ❌ FAILED: ${def.name}`);
+        console.error(`     Message: ${err.message}\n`);
+      }
+    }
   } finally {
+    // Clean up all generated sample files and tracked document files
+    for (const filePath of createdSampleFiles) {
+      await safeDeleteFile(filePath);
+    }
+    for (const docId of trackedDocumentIds) {
+      const rec = getDocumentRecord(docId);
+      if (rec) {
+        await safeDeleteFile(rec.originalFilePath);
+        await safeDeleteFile(rec.redactedFilePath);
+      }
+    }
+    const origRetention = config.upload.fileRetentionMs;
+    try {
+      config.upload.fileRetentionMs = -1;
+      await cleanupExpiredFiles();
+    } finally {
+      config.upload.fileRetentionMs = origRetention;
+    }
     server.close();
+  }
+
+  const passedCount = results.filter((r) => r.status === 'PASSED').length;
+  const failedCount = results.filter((r) => r.status === 'FAILED').length;
+  const notExecutedCount = results.filter((r) => r.status === 'NOT_EXECUTED').length;
+
+  console.log('================================================================');
+  console.log('📊 DOCSHIELD TEST SUITE EXECUTION SUMMARY');
+  console.log('================================================================');
+  console.log(`Total Tests:   ${results.length}`);
+  console.log(`Passed:        ${passedCount}`);
+  console.log(`Failed:        ${failedCount}`);
+  console.log(`Not Executed:  ${notExecutedCount}`);
+  console.log('----------------------------------------------------------------');
+  for (const r of results) {
+    console.log(`- [${r.status}] ${r.name}`);
+    if (r.error) {
+      console.log(`    Error: ${r.error.stack || r.error.message}`);
+    }
+  }
+  console.log('================================================================');
+
+  if (failedCount > 0) {
+    process.exit(1);
   }
 }
 
 runTests().catch((err) => {
-  console.error('❌ Test suite failed:', err);
+  console.error('❌ Unhandled test runner error:', err);
   process.exit(1);
 });
