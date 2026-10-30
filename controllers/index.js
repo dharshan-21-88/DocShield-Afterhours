@@ -197,7 +197,12 @@ export async function detectSensitiveController(req, res, next) {
  */
 export async function redactPdfController(req, res, next) {
   try {
-    const { documentId, mode = 'automatic', selectedItemIds } = req.body || {};
+    const {
+      documentId,
+      mode = 'automatic',
+      selectedItemIds,
+      failOnUnsafeObfuscation = false,
+    } = req.body || {};
 
     if (!documentId || typeof documentId !== 'string') {
       return res.status(400).json({
@@ -275,7 +280,12 @@ export async function redactPdfController(req, res, next) {
 
     const redactionOutput = await generatePermanentlyRedactedPdf(
       docRecord.originalFilePath,
-      itemsToRedact
+      itemsToRedact,
+      {
+        allDetectedItems: detectedItems,
+        extraction: docRecord.extraction,
+        failOnUnsafeObfuscation: Boolean(failOnUnsafeObfuscation),
+      }
     );
 
     // Clean up any previous redacted file only after the new redaction has succeeded
@@ -290,6 +300,8 @@ export async function redactPdfController(req, res, next) {
       redactedFilePath: redactionOutput.redactedFilePath,
       redactedSha256: redactionOutput.sha256,
       redactedFileSizeBytes: redactionOutput.fileSizeBytes,
+      maskObfuscation: redactionOutput.maskObfuscationSummary,
+      maskGeometryAudit: redactionOutput.maskGeometryAudit,
     });
 
     res.status(200).json({
@@ -302,8 +314,14 @@ export async function redactPdfController(req, res, next) {
       redactedPdfSha256: redactionOutput.sha256,
       redactedFileSizeBytes: redactionOutput.fileSizeBytes,
       downloadUrl: `/api/download/${documentId}`,
+      maskObfuscationApplied: redactionOutput.maskObfuscationApplied,
+      obfuscationStatus: redactionOutput.obfuscationStatus,
+      obfuscationStrategy: redactionOutput.obfuscationStrategy,
+      obfuscationWarnings: redactionOutput.obfuscationWarnings,
+      maskGeometryAudit: redactionOutput.maskGeometryAudit,
+      maskObfuscation: redactionOutput.maskObfuscationSummary,
       notice:
-        'Pages were rendered to raster images, masked permanently, and rebuilt into a new PDF. Original embedded text layers have been stripped, which reduces text selectability and searchability in exchange for permanent removal.',
+        'Pages were rendered to raster images, masked permanently with standardized dimension obfuscation where safe, and rebuilt into a new PDF. Original embedded text layers have been stripped, which reduces text selectability and searchability in exchange for permanent removal.',
     });
   } catch (err) {
     next(err);

@@ -76,6 +76,35 @@ export function buildPrivacyAssessmentReport({
     summaryText += ` Note: Pre-redaction structural inspection of the uploaded PDF flagged ${structuralWarningCount} hidden-structure warning(s).`;
   }
 
+  const maskObfuscation = documentRecord.maskObfuscation || null;
+  const geomById = new Map(
+    (documentRecord.maskGeometryAudit || maskObfuscation?.items || []).map((g) => [g.id, g])
+  );
+
+  // Sanitize removedSensitiveItems so raw sensitive text is never exposed in the report,
+  // while attaching originalBoundingBox, finalMaskBoundingBox, and obfuscation metadata
+  const sanitizedRemovedItems = (verificationResult.removedItems || []).map((item) => {
+    const geom = geomById.get(item.id);
+    const { text: _omittedRawText, ...safeItem } = item;
+    return {
+      ...safeItem,
+      maskObfuscationApplied: geom ? Boolean(geom.maskObfuscationApplied) : false,
+      obfuscationStatus: geom?.obfuscationStatus || 'NOT_APPLICABLE',
+      obfuscationStrategy: geom?.obfuscationStrategy || null,
+      originalBoundingBox: geom?.originalBoundingBox || item.boundingBox || null,
+      finalMaskBoundingBox: geom?.finalMaskBoundingBox || null,
+      obfuscationWarnings: geom?.obfuscationWarnings || [],
+    };
+  });
+
+  if (
+    maskObfuscation &&
+    Array.isArray(maskObfuscation.obfuscationWarnings) &&
+    maskObfuscation.obfuscationWarnings.length > 0
+  ) {
+    summaryText += ` Note: ${maskObfuscation.obfuscationWarnings.length} redaction mask(s) could not be expanded to full standardized bucket dimensions due to adjacent content or unselected items.`;
+  }
+
   return {
     reportId,
     documentId: documentRecord.documentId,
@@ -98,9 +127,10 @@ export function buildPrivacyAssessmentReport({
       disclaimer:
         'This privacy assessment is an indicative evaluation based on automated pattern matching, OCR verification, and PDF structural verification. It is not a guarantee of absolute anonymity or legal compliance. Always review the exported PDF visually before sharing.',
     },
-    removedSensitiveItems: verificationResult.removedItems || [],
+    removedSensitiveItems: sanitizedRemovedItems,
     remainingSensitiveItems: remainingItems,
     ...(structuralAudit ? { structuralAudit } : {}),
+    ...(maskObfuscation ? { maskObfuscation } : {}),
     ocrVerification,
     structuralVerification,
     verificationDetails: {
@@ -110,6 +140,7 @@ export function buildPrivacyAssessmentReport({
       selectedStillDetectableCount: verificationResult.selectedStillDetectableCount,
       ocrVerification,
       structuralVerification,
+      ...(maskObfuscation ? { maskObfuscation } : {}),
     },
     exportedDocumentIntegrity: {
       algorithm: 'SHA-256',

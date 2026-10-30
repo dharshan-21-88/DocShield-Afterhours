@@ -6,6 +6,12 @@ import { createApp } from '../server.js';
 import { generateSamplePdfFile } from '../extraction/samples.js';
 import { extractPdfContent } from '../extraction/index.js';
 import { verifyRedactedPdf, verifyExportedPdfStructure } from '../verification/index.js';
+import {
+  computeObfuscatedMaskGeometry,
+  STANDARD_MASK_WIDTH_BUCKETS_PT,
+  STANDARD_MASK_HEIGHT_BUCKETS_PT,
+  MASK_OBFUSCATION_STRATEGY,
+} from '../redaction/index.js';
 import { config } from '../config/index.js';
 import {
   getDocumentRecord,
@@ -3062,6 +3068,544 @@ async function runTests() {
         assert.strictEqual(repBody.report.structuralVerification.status, 'PASSED');
         assert.strictEqual(repBody.report.verificationDetails.ocrVerification.status, 'PASSED');
         assert.strictEqual(repBody.report.verificationDetails.structuralVerification.status, 'PASSED');
+      },
+    },
+
+    // =========================================================================
+    // P3 REDACTION MASK DIMENSION OBFUSCATION REGRESSION TESTS
+    // =========================================================================
+    {
+      name: '[P3 Test A] Short and Long Sensitive Values Produce Identical Standardized Mask Dimensions Without Altering Original Detection Coordinates',
+      fn: async () => {
+        // 1. Direct unit test of computeObfuscatedMaskGeometry:
+        //    A narrow 36pt box (e.g. 6-digit PIN) and a wide 195pt box (e.g. 32-char email)
+        //    must produce identical standardized mask width (240pt) and height (22pt)
+        const shortOrig = { x: 90, y: 120, width: 36, height: 12, coordinateSpace: 'pdf-top-left-points' };
+        const longOrig = { x: 90, y: 180, width: 195, height: 14, coordinateSpace: 'pdf-top-left-points' };
+
+        const shortGeom = computeObfuscatedMaskGeometry(shortOrig, {
+          pageDimensions: { width: 595.28, height: 841.89 },
+          obstacles: [],
+        });
+        const longGeom = computeObfuscatedMaskGeometry(longOrig, {
+          pageDimensions: { width: 595.28, height: 841.89 },
+          obstacles: [],
+        });
+
+        assert.strictEqual(shortGeom.maskObfuscationApplied, true);
+        assert.strictEqual(longGeom.maskObfuscationApplied, true);
+        assert.strictEqual(shortGeom.obfuscationStrategy, MASK_OBFUSCATION_STRATEGY);
+        assert.strictEqual(
+          shortGeom.finalMaskBoundingBox.width,
+          STANDARD_MASK_WIDTH_BUCKETS_PT[0],
+          `Short box must standardize to ${STANDARD_MASK_WIDTH_BUCKETS_PT[0]}pt width`
+        );
+        assert.strictEqual(
+          longGeom.finalMaskBoundingBox.width,
+          STANDARD_MASK_WIDTH_BUCKETS_PT[0],
+          `Long box must standardize to ${STANDARD_MASK_WIDTH_BUCKETS_PT[0]}pt width`
+        );
+        assert.strictEqual(
+          shortGeom.finalMaskBoundingBox.width,
+          longGeom.finalMaskBoundingBox.width,
+          'Short and long values in the same tier must produce identical final mask width'
+        );
+        assert.strictEqual(
+          shortGeom.finalMaskBoundingBox.height,
+          STANDARD_MASK_HEIGHT_BUCKETS_PT[0]
+        );
+        assert.strictEqual(
+          shortGeom.finalMaskBoundingBox.height,
+          longGeom.finalMaskBoundingBox.height,
+          'Short and long single-line values must produce identical final mask height'
+        );
+        // Verify original boxes were not mutated
+        assert.strictEqual(shortOrig.width, 36);
+        assert.strictEqual(longOrig.width, 195);
+
+        // 2. End-to-end PDF test with a short 10-char PAN (ABCDE1234F) and a long 32-char Email (ananya.sharma@fictional-univ.edu)
+        const pdfDoc = await PDFDocument.create();
+        const font = await pdfDoc.embedFont(StandardFonts.Helvetica);
+        const page = pdfDoc.addPage([595.28, 841.89]);
+        page.drawText('Short PAN: ABCDE1234F', { x: 50, y: 740, size: 12, font });
+        page.drawText('Long Email: ananya.sharma@fictional-univ.edu', { x: 50, y: 690, size: 12, font });
+
+        const buf = Buffer.from(await pdfDoc.save());
+        const up = await uploadCustomPdfBuffer(buf, 'p3_short_vs_long.pdf');
+        assert.strictEqual(up.status, 201);
+        const docId = up.body.documentId;
+
+        const detRes = await fetch(`${baseUrl}/api/detect`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ documentId: docId }),
+        });
+        const detBody = await detRes.json();
+        assert.strictEqual(detRes.status, 200);
+        assert.strictEqual(detBody.totalDetected, 2);
+
+        const panDet = detBody.items.find((i) => i.category === 'NATIONAL_ID_PAN');
+        const emailDet = detBody.items.find((i) => i.category === 'EMAIL_ADDRESS');
+        assert.ok(panDet && emailDet);
+        const panOrigWidthBefore = panDet.boundingBox.width;
+        const emailOrigWidthBefore = emailDet.boundingBox.width;
+        assert.ok(
+          emailOrigWidthBefore - panOrigWidthBefore > 60,
+          `Original detection widths must differ substantially before obfuscation (PAN=${panOrigWidthBefore}, Email=${emailOrigWidthBefore})`
+        );
+
+        const redRes = await fetch(`${baseUrl}/api/redact`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ documentId: docId, mode: 'automatic' }),
+        });
+        const redBody = await redRes.json();
+        assert.strictEqual(redRes.status, 200);
+        assert.strictEqual(redBody.maskObfuscationApplied, true);
+
+        const panAudit = redBody.maskGeometryAudit.find((a) => a.id === panDet.id);
+        const emailAudit = redBody.maskGeometryAudit.find((a) => a.id === emailDet.id);
+        assert.ok(panAudit && emailAudit);
+        assert.strictEqual(panAudit.maskObfuscationApplied, true);
+        assert.strictEqual(emailAudit.maskObfuscationApplied, true);
+        assert.strictEqual(
+          panAudit.finalMaskBoundingBox.width,
+          emailAudit.finalMaskBoundingBox.width,
+          `Short PAN and long Email must receive identical finalMaskBoundingBox.width (${panAudit.finalMaskBoundingBox.width} vs ${emailAudit.finalMaskBoundingBox.width})`
+        );
+        assert.strictEqual(panAudit.finalMaskBoundingBox.width, 240);
+        assert.strictEqual(panAudit.originalBoundingBox.width, panOrigWidthBefore);
+        assert.strictEqual(emailAudit.originalBoundingBox.width, emailOrigWidthBefore);
+      },
+    },
+    {
+      name: '[P3 Test B] Automatic Redaction Applies Dimension Obfuscation & Reports Sanitized Audit Metadata Without Exposing Raw Sensitive Text',
+      fn: async () => {
+        const pdfDoc = await PDFDocument.create();
+        const font = await pdfDoc.embedFont(StandardFonts.Helvetica);
+        const page = pdfDoc.addPage([595.28, 841.89]);
+        page.drawText('Applicant PAN: ABCDE1234F', { x: 50, y: 740, size: 12, font });
+        page.drawText('Applicant Aadhaar: 4829 7301 9482', { x: 50, y: 700, size: 12, font });
+        page.drawText('Applicant Phone: +91 9876543210', { x: 50, y: 660, size: 12, font });
+
+        const buf = Buffer.from(await pdfDoc.save());
+        const up = await uploadCustomPdfBuffer(buf, 'p3_auto_redact_audit.pdf');
+        assert.strictEqual(up.status, 201);
+        const docId = up.body.documentId;
+
+        await fetch(`${baseUrl}/api/detect`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ documentId: docId }),
+        });
+
+        const redRes = await fetch(`${baseUrl}/api/redact`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ documentId: docId, mode: 'automatic' }),
+        });
+        const redBody = await redRes.json();
+        assert.strictEqual(redRes.status, 200);
+        assert.strictEqual(redBody.maskObfuscationApplied, true);
+        assert.strictEqual(redBody.obfuscationStatus, 'OBFUSCATED');
+        assert.strictEqual(redBody.obfuscationStrategy, MASK_OBFUSCATION_STRATEGY);
+        assert.strictEqual(redBody.obfuscationWarnings.length, 0);
+        assert.strictEqual(redBody.maskGeometryAudit.length, 3);
+
+        // Verify none of the audit entries or response JSON expose raw sensitive strings
+        const redJsonStr = JSON.stringify(redBody);
+        assert.strictEqual(redJsonStr.includes('ABCDE1234F'), false, 'Redact response must not expose raw PAN');
+        assert.strictEqual(redJsonStr.includes('4829 7301 9482'), false, 'Redact response must not expose raw Aadhaar');
+        assert.strictEqual(redJsonStr.includes('9876543210'), false, 'Redact response must not expose raw Phone');
+
+        for (const auditItem of redBody.maskGeometryAudit) {
+          assert.strictEqual(auditItem.maskObfuscationApplied, true);
+          assert.strictEqual(auditItem.obfuscationStrategy, MASK_OBFUSCATION_STRATEGY);
+          assert.ok(auditItem.originalBoundingBox && auditItem.originalBoundingBox.width > 0);
+          assert.ok(auditItem.finalMaskBoundingBox && auditItem.finalMaskBoundingBox.width === 240);
+          assert.strictEqual('text' in auditItem, false, 'Audit item must never include raw text property');
+        }
+
+        const verRes = await fetch(`${baseUrl}/api/verify`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ documentId: docId, runOcrCheck: true }),
+        });
+        const verBody = await verRes.json();
+        assert.strictEqual(verRes.status, 200);
+        assert.strictEqual(verBody.verified, true);
+        assert.strictEqual(verBody.report.maskObfuscation.maskObfuscationApplied, true);
+        assert.strictEqual(verBody.report.maskObfuscation.obfuscationStrategy, MASK_OBFUSCATION_STRATEGY);
+
+        // Verify report.removedSensitiveItems contains originalBoundingBox & finalMaskBoundingBox without raw text
+        for (const remItem of verBody.report.removedSensitiveItems) {
+          assert.strictEqual(remItem.maskObfuscationApplied, true);
+          assert.ok(remItem.originalBoundingBox);
+          assert.ok(remItem.finalMaskBoundingBox);
+          assert.strictEqual('text' in remItem, false, 'Report removedSensitiveItems must not expose raw text');
+        }
+      },
+    },
+    {
+      name: '[P3 Test C] Selective Redaction Preserves Unselected Neighboring Text & Blocks Unsafe Mask Expansion Over Unselected Detections',
+      fn: async () => {
+        const pdfDoc = await PDFDocument.create();
+        const font = await pdfDoc.embedFont(StandardFonts.Helvetica);
+        const page = pdfDoc.addPage([595.28, 841.89]);
+
+        // Place selected PAN and unselected Email on the SAME line so expanding PAN to 240pt would collide with the unselected Email
+        page.drawText('PAN: ABCDE1234F', { x: 50, y: 720, size: 12, font });
+        page.drawText('Unselected Email: preserve.me@fictional-univ.edu', { x: 185, y: 720, size: 12, font });
+        // Also place a selected Phone on its own open line below
+        page.drawText('Selected Phone: +91 9876543210', { x: 50, y: 660, size: 12, font });
+
+        const buf = Buffer.from(await pdfDoc.save());
+        const up = await uploadCustomPdfBuffer(buf, 'p3_selective_neighbor_safety.pdf');
+        assert.strictEqual(up.status, 201);
+        const docId = up.body.documentId;
+
+        const detRes = await fetch(`${baseUrl}/api/detect`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ documentId: docId }),
+        });
+        const detBody = await detRes.json();
+        assert.strictEqual(detRes.status, 200);
+        assert.strictEqual(detBody.totalDetected, 3);
+
+        const panItem = detBody.items.find((i) => i.category === 'NATIONAL_ID_PAN');
+        const emailItem = detBody.items.find((i) => i.category === 'EMAIL_ADDRESS');
+        const phoneItem = detBody.items.find((i) => i.category === 'PHONE_NUMBER');
+        assert.ok(panItem && emailItem && phoneItem);
+
+        // Selectively redact PAN and Phone, leaving Email unselected
+        const redRes = await fetch(`${baseUrl}/api/redact`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            documentId: docId,
+            mode: 'selective',
+            selectedItemIds: [panItem.id, phoneItem.id],
+          }),
+        });
+        const redBody = await redRes.json();
+        assert.strictEqual(redRes.status, 200);
+
+        // Phone on open line is obfuscated (240pt), while PAN next to unselected Email is constrained
+        const panAudit = redBody.maskGeometryAudit.find((a) => a.id === panItem.id);
+        const phoneAudit = redBody.maskGeometryAudit.find((a) => a.id === phoneItem.id);
+        assert.strictEqual(
+          panAudit.maskObfuscationApplied,
+          false,
+          'PAN adjacent to unselected Email must NOT claim full bucket obfuscation'
+        );
+        assert.strictEqual(panAudit.obfuscationStatus, 'UNSAFE_EXPANSION_BLOCKED');
+        assert.ok(
+          panAudit.finalMaskBoundingBox.x + panAudit.finalMaskBoundingBox.width <= emailItem.boundingBox.x,
+          'Constrained PAN mask must not overlap unselected Email bounding box'
+        );
+        assert.strictEqual(phoneAudit.maskObfuscationApplied, true, 'Phone on open line must be obfuscated');
+        assert.strictEqual(phoneAudit.finalMaskBoundingBox.width, 240);
+        assert.strictEqual(redBody.obfuscationStatus, 'PARTIALLY_OBFUSCATED');
+        assert.strictEqual(redBody.obfuscationWarnings.length, 1);
+
+        // Verify via OCR that both selected items were removed AND unselected Email remains intact
+        const verRes = await fetch(`${baseUrl}/api/verify`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ documentId: docId, runOcrCheck: true }),
+        });
+        const verBody = await verRes.json();
+        assert.strictEqual(verRes.status, 200);
+        assert.strictEqual(verBody.verification.successfullyRemovedCount, 2);
+        assert.strictEqual(verBody.verification.selectedStillDetectableCount, 0);
+        assert.strictEqual(
+          verBody.verification.remainingItems.some((r) => r.text === 'preserve.me@fictional-univ.edu'),
+          true,
+          'Unselected neighboring email on the same line must remain intact and detectable by OCR'
+        );
+      },
+    },
+    {
+      name: '[P3 Test D] Overlapping and Adjacent Selected Detections Do Not Cause Accidental Over-Redaction of Neighboring Content',
+      fn: async () => {
+        const pdfDoc = await PDFDocument.create();
+        const font = await pdfDoc.embedFont(StandardFonts.Helvetica);
+        const page = pdfDoc.addPage([595.28, 841.89]);
+
+        // Two close/overlapping selected detections on the left of a line, plus non-sensitive neighbor text on the right
+        page.drawText('IDs: ABCDE1234F / ZYXWV9876K', { x: 45, y: 710, size: 11, font });
+        page.drawText('KEEP_VISIBLE_MARKER_7788', { x: 235, y: 710, size: 12, font });
+
+        const buf = Buffer.from(await pdfDoc.save());
+        const up = await uploadCustomPdfBuffer(buf, 'p3_overlapping_detections.pdf');
+        assert.strictEqual(up.status, 201);
+        const docId = up.body.documentId;
+
+        const detRes = await fetch(`${baseUrl}/api/detect`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ documentId: docId }),
+        });
+        const detBody = await detRes.json();
+        assert.strictEqual(detRes.status, 200);
+        assert.strictEqual(detBody.totalDetected, 2, 'Must detect both PAN values on the line');
+
+        const redRes = await fetch(`${baseUrl}/api/redact`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ documentId: docId, mode: 'automatic' }),
+        });
+        const redBody = await redRes.json();
+        assert.strictEqual(redRes.status, 200);
+
+        // Neither mask may extend past x = 235 where KEEP_VISIBLE_MARKER_7788 begins
+        for (const auditItem of redBody.maskGeometryAudit) {
+          const rightEdge = auditItem.finalMaskBoundingBox.x + auditItem.finalMaskBoundingBox.width;
+          assert.ok(
+            rightEdge <= 235,
+            `Mask right edge (${rightEdge}) must not intrude into neighboring content at x=235`
+          );
+        }
+
+        // Verify via OCR on the exported PDF that both PANs are removed and KEEP_VISIBLE_MARKER_7788 is still readable
+        const rec = getDocumentRecord(docId);
+        const postExt = await extractPdfContent(rec.redactedFilePath, { forceOcr: true });
+        const ocrText = (postExt.pages[0]?.text || '').toUpperCase();
+        assert.strictEqual(ocrText.includes('ABCDE1234F'), false, 'First PAN must be redacted');
+        assert.strictEqual(ocrText.includes('ZYXWV9876K'), false, 'Second PAN must be redacted');
+        assert.strictEqual(
+          ocrText.includes('KEEP') || ocrText.includes('VISIBLE') || ocrText.includes('7788'),
+          true,
+          `Neighboring non-sensitive text must remain visible after redacting adjacent/overlapping items (OCR text: "${ocrText}")`
+        );
+      },
+    },
+    {
+      name: '[P3 Test E] OCR-Based Detections on Scanned PDFs Use Standardized Dimension Obfuscation',
+      fn: async () => {
+        const scannedBuf = await createCustomScannedPdfBuffer([
+          { text: 'SCANNED DOCUMENT RECORD (SYNTHETIC)', x: 80, y: 140, font: 'bold 30px sans-serif' },
+          { text: 'Scanned PAN: ABCDE1234F', x: 80, y: 260, font: '28px sans-serif' },
+          { text: 'Scanned Phone: +91 9876543210', x: 80, y: 360, font: '28px sans-serif' },
+        ]);
+
+        const up = await uploadCustomPdfBuffer(scannedBuf, 'p3_scanned_ocr_obfuscation.pdf');
+        assert.strictEqual(up.status, 201);
+        const docId = up.body.documentId;
+
+        const detRes = await fetch(`${baseUrl}/api/detect`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ documentId: docId }),
+        });
+        const detBody = await detRes.json();
+        assert.strictEqual(detRes.status, 200);
+        assert.ok(detBody.totalDetected >= 2, 'Must detect PAN and Phone via OCR on scanned PDF');
+        assert.strictEqual(up.body.extraction.extractionMethod, 'ocr-fallback');
+
+        const redRes = await fetch(`${baseUrl}/api/redact`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ documentId: docId, mode: 'automatic' }),
+        });
+        const redBody = await redRes.json();
+        assert.strictEqual(redRes.status, 200);
+        assert.strictEqual(redBody.maskObfuscationApplied, true);
+        assert.strictEqual(redBody.obfuscationStatus, 'OBFUSCATED');
+        assert.strictEqual(redBody.obfuscationStrategy, MASK_OBFUSCATION_STRATEGY);
+
+        // Both OCR detections must standardize to the exact same 240pt bucket width
+        for (const auditItem of redBody.maskGeometryAudit) {
+          assert.strictEqual(auditItem.source, 'ocr');
+          assert.strictEqual(auditItem.maskObfuscationApplied, true);
+          assert.strictEqual(auditItem.finalMaskBoundingBox.width, 240);
+        }
+
+        const verRes = await fetch(`${baseUrl}/api/verify`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ documentId: docId, runOcrCheck: true }),
+        });
+        const verBody = await verRes.json();
+        assert.strictEqual(verRes.status, 200);
+        assert.strictEqual(verBody.verification.selectedStillDetectableCount, 0);
+      },
+    },
+    {
+      name: '[P3 Test F] Hybrid PDF Detections (Selectable Text + Embedded Image OCR) Use Standardized Dimension Obfuscation',
+      fn: async () => {
+        // Create an embedded image containing a synthetic phone number
+        const imgCanvas = createCanvas(700, 180);
+        const imgCtx = imgCanvas.getContext('2d');
+        imgCtx.fillStyle = '#ffffff';
+        imgCtx.fillRect(0, 0, 700, 180);
+        imgCtx.fillStyle = '#000000';
+        imgCtx.font = 'bold 28px sans-serif';
+        imgCtx.fillText('Image Phone: +91 9876543210', 30, 95);
+        const pngBytes = imgCanvas.toBuffer('image/png');
+
+        const pdfDoc = await PDFDocument.create();
+        const font = await pdfDoc.embedFont(StandardFonts.Helvetica);
+        const page = pdfDoc.addPage([595.28, 841.89]);
+
+        page.drawText('HYBRID ACADEMIC & IDENTITY RECORD (SYNTHETIC DOCUMENT FOR TESTING)', {
+          x: 50,
+          y: 770,
+          size: 13,
+          font,
+        });
+        page.drawText('Selectable Text PAN: ABCDE1234F', {
+          x: 50,
+          y: 720,
+          size: 12,
+          font,
+        });
+
+        const embeddedPng = await pdfDoc.embedPng(pngBytes);
+        page.drawImage(embeddedPng, {
+          x: 50,
+          y: 460,
+          width: 350,
+          height: 90,
+        });
+
+        const buf = Buffer.from(await pdfDoc.save());
+        const up = await uploadCustomPdfBuffer(buf, 'p3_hybrid_obfuscation.pdf');
+        assert.strictEqual(up.status, 201);
+        const docId = up.body.documentId;
+
+        const detRes = await fetch(`${baseUrl}/api/detect`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ documentId: docId }),
+        });
+        const detBody = await detRes.json();
+        assert.strictEqual(detRes.status, 200);
+        assert.strictEqual(detBody.totalDetected, 2);
+
+        const textPan = detBody.items.find((i) => i.category === 'NATIONAL_ID_PAN');
+        const imgPhone = detBody.items.find((i) => i.category === 'PHONE_NUMBER');
+        assert.ok(textPan && imgPhone, 'Must detect both selectable text PAN and embedded image OCR Phone');
+
+        const redRes = await fetch(`${baseUrl}/api/redact`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ documentId: docId, mode: 'automatic' }),
+        });
+        const redBody = await redRes.json();
+        assert.strictEqual(redRes.status, 200);
+        assert.strictEqual(redBody.maskObfuscationApplied, true);
+        assert.strictEqual(redBody.obfuscationStatus, 'OBFUSCATED');
+
+        assert.strictEqual(up.body.extraction.extractionMethod, 'hybrid');
+        const textAudit = redBody.maskGeometryAudit.find((a) => a.id === textPan.id);
+        const imgAudit = redBody.maskGeometryAudit.find((a) => a.id === imgPhone.id);
+        assert.strictEqual(textAudit.source, 'pdf-text');
+        assert.strictEqual(imgAudit.source, 'ocr');
+        assert.strictEqual(textAudit.maskObfuscationApplied, true);
+        assert.strictEqual(imgAudit.maskObfuscationApplied, true);
+        assert.strictEqual(
+          textAudit.finalMaskBoundingBox.width,
+          imgAudit.finalMaskBoundingBox.width,
+          'Hybrid PDF text detection and embedded-image OCR detection must produce identical standardized bucket width (240pt)'
+        );
+        assert.strictEqual(textAudit.finalMaskBoundingBox.width, 240);
+
+        const verRes = await fetch(`${baseUrl}/api/verify`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ documentId: docId, runOcrCheck: true }),
+        });
+        const verBody = await verRes.json();
+        assert.strictEqual(verRes.status, 200);
+        assert.strictEqual(verBody.verification.selectedStillDetectableCount, 0);
+      },
+    },
+    {
+      name: '[P3 Test G] Unsafe Mask Expansion Produces Explicit Warning (or 422 Failure in Strict Mode) Rather Than Silently Covering Neighboring Content',
+      fn: async () => {
+        const pdfDoc = await PDFDocument.create();
+        const font = await pdfDoc.embedFont(StandardFonts.Helvetica);
+        const page = pdfDoc.addPage([595.28, 841.89]);
+
+        // Single text run where sensitive PAN is followed closely on the same line by non-sensitive text
+        page.drawText('PAN: ABCDE1234F   Department: Aerospace Engineering', {
+          x: 50,
+          y: 720,
+          size: 12,
+          font,
+        });
+
+        const buf = Buffer.from(await pdfDoc.save());
+        const up = await uploadCustomPdfBuffer(buf, 'p3_unsafe_expansion_warning.pdf');
+        assert.strictEqual(up.status, 201);
+        const docId = up.body.documentId;
+
+        await fetch(`${baseUrl}/api/detect`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ documentId: docId }),
+        });
+
+        // 1. Strict mode (failOnUnsafeObfuscation: true) must reject with HTTP 422 MASK_OBFUSCATION_UNSAFE
+        const strictRes = await fetch(`${baseUrl}/api/redact`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            documentId: docId,
+            mode: 'automatic',
+            failOnUnsafeObfuscation: true,
+          }),
+        });
+        const strictBody = await strictRes.json();
+        assert.strictEqual(strictRes.status, 422, 'Strict mode must fail with 422 when bucket expansion is unsafe');
+        assert.strictEqual(strictBody.error, 'MASK_OBFUSCATION_UNSAFE');
+        assert.strictEqual(strictBody.details.blockedCount, 1);
+        assert.strictEqual(
+          strictBody.details.obfuscationWarnings[0].code,
+          'MASK_EXPANSION_BLOCKED_BY_NEIGHBOR_CONTENT'
+        );
+
+        // 2. Default safe-fallback mode must constrain the mask to avoid covering "Department: Aerospace Engineering",
+        //    never claim maskObfuscationApplied: true, and emit an explicit warning
+        const safeRes = await fetch(`${baseUrl}/api/redact`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            documentId: docId,
+            mode: 'automatic',
+          }),
+        });
+        const safeBody = await safeRes.json();
+        assert.strictEqual(safeRes.status, 200);
+        assert.strictEqual(
+          safeBody.maskObfuscationApplied,
+          false,
+          'Must NEVER claim maskObfuscationApplied: true when expansion was blocked by neighboring content'
+        );
+        assert.strictEqual(safeBody.obfuscationStatus, 'UNSAFE_EXPANSION_BLOCKED');
+        assert.strictEqual(safeBody.obfuscationWarnings.length, 1);
+        assert.strictEqual(
+          safeBody.obfuscationWarnings[0].code,
+          'MASK_EXPANSION_BLOCKED_BY_NEIGHBOR_CONTENT'
+        );
+        assert.ok(
+          safeBody.obfuscationWarnings[0].reason.includes('avoid over-redacting adjacent non-redacted page content')
+        );
+        // Ensure raw sensitive value is never leaked in warning message
+        assert.strictEqual(JSON.stringify(safeBody.obfuscationWarnings).includes('ABCDE1234F'), false);
+
+        // Verify via OCR on exported PDF that PAN is removed while "Aerospace Engineering" was NOT over-redacted
+        const rec = getDocumentRecord(docId);
+        const postExt = await extractPdfContent(rec.redactedFilePath, { forceOcr: true });
+        const pageOcrText = (postExt.pages[0]?.text || '').toLowerCase();
+        assert.strictEqual(pageOcrText.includes('abcde1234f'), false, 'Target PAN must still be permanently redacted');
+        assert.strictEqual(
+          pageOcrText.includes('aerospace') || pageOcrText.includes('engineering'),
+          true,
+          `Adjacent non-redacted text "Department: Aerospace Engineering" must remain readable (got OCR: "${pageOcrText}")`
+        );
       },
     },
   ];
