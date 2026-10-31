@@ -7,8 +7,11 @@
     "dev": "node server.js",
     "dev:backend": "node server.js",
     "dev:frontend": "npm --prefix frontend run dev",
+    "build": "npm --prefix frontend install && npm --prefix frontend run build",
     "build:frontend": "npm --prefix frontend run build",
-    "start": "node server.js",
+    "start": "node start-production.js",
+    "start:backend": "node server.js",
+    "start:frontend": "npm --prefix frontend start",
     "test": "node tests/run-tests.js",
     "test:backend": "node tests/run-tests.js",
     "lint": "node --check server.js"

@@ -10,7 +10,10 @@ import { NextRequest, NextResponse } from "next/server";
  * path, query, method, JSON and multipart bodies are forwarded untouched.
  */
 
-const BACKEND = "http://localhost:3002";
+const BACKEND =
+  process.env.BACKEND_URL ||
+  process.env.DOCSHIELD_BACKEND_URL ||
+  "http://localhost:3002";
 
 const REQUEST_FORWARD_HEADERS = ["content-type", "accept", "authorization"];
 const RESPONSE_FORWARD_HEADERS = [

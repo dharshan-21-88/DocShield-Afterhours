@@ -137,6 +137,23 @@ DocShield Test Suite: 64 passed, 0 failed
 
 ---
 
-## 7. License
+## 7. Cloud Deployment (Railway)
+
+DocShield is pre-configured for **1-click deployment on Railway** using the included `railway.json` and `start-production.js`:
+
+### Steps to Deploy on Railway:
+
+1. **Log into Railway:** Go to [railway.app](https://railway.app) and sign in with GitHub.
+2. **New Project:** Click **New Project** → **Deploy from GitHub repo**.
+3. **Select Repository:** Choose `dharshan-21-88/DocShield-Afterhours`.
+4. **Deploy:** Railway automatically detects the project using `railway.json`, runs `npm run build` to compile the Next.js frontend, and runs `npm start` (`node start-production.js`), which:
+   - Starts the Express engine on internal port `3002`.
+   - Starts the Next.js studio on public port `$PORT`.
+   - Automatically proxies all API calls locally with zero CORS configuration.
+5. **Generate Domain:** In Railway Dashboard → Project Settings → **Networking**, click **Generate Domain** to get your live public URL (e.g. `https://docshield-production.up.railway.app`).
+
+---
+
+## 8. License
 
 Distributed under the MIT License. See `LICENSE` for details.
