@@ -1,0 +1,186 @@
+@import "tailwindcss";
+@import "tw-animate-css";
+
+@custom-variant dark (&:is(.dark *));
+
+@theme inline {
+  --color-background: var(--background);
+  --color-foreground: var(--foreground);
+  --font-sans: var(--font-geist-sans);
+  --font-mono: var(--font-geist-mono);
+  --color-sidebar-ring: var(--sidebar-ring);
+  --color-sidebar-border: var(--sidebar-border);
+  --color-sidebar-accent-foreground: var(--sidebar-accent-foreground);
+  --color-sidebar-accent: var(--sidebar-accent);
+  --color-sidebar-primary-foreground: var(--sidebar-primary-foreground);
+  --color-sidebar-primary: var(--sidebar-primary);
+  --color-sidebar-foreground: var(--sidebar-foreground);
+  --color-sidebar: var(--sidebar);
+  --color-chart-5: var(--chart-5);
+  --color-chart-4: var(--chart-4);
+  --color-chart-3: var(--chart-3);
+  --color-chart-2: var(--chart-2);
+  --color-chart-1: var(--chart-1);
+  --color-ring: var(--ring);
+  --color-input: var(--input);
+  --color-border: var(--border);
+  --color-destructive: var(--destructive);
+  --color-success: var(--success);
+  --color-warning: var(--warning);
+  --color-accent-foreground: var(--accent-foreground);
+  --color-accent: var(--accent);
+  --color-muted-foreground: var(--muted-foreground);
+  --color-muted: var(--muted);
+  --color-secondary-foreground: var(--secondary-foreground);
+  --color-secondary: var(--secondary);
+  --color-primary-foreground: var(--primary-foreground);
+  --color-primary: var(--primary);
+  --color-popover-foreground: var(--popover-foreground);
+  --color-popover: var(--popover);
+  --color-card-foreground: var(--card-foreground);
+  --color-card: var(--card);
+  --radius-sm: calc(var(--radius) - 4px);
+  --radius-md: calc(var(--radius) - 2px);
+  --radius-lg: var(--radius);
+  --radius-xl: calc(var(--radius) + 4px);
+}
+
+:root {
+  --radius: 0.625rem;
+  /* DocShield editorial palette */
+  --background: #f7f7f2;
+  --foreground: #171a19;
+  --card: #ffffff;
+  --card-foreground: #171a19;
+  --popover: #ffffff;
+  --popover-foreground: #171a19;
+  --primary: #171a19;
+  --primary-foreground: #f7f7f2;
+  --secondary: #ecece2;
+  --secondary-foreground: #232823;
+  --muted: #efefe7;
+  --muted-foreground: #6c7270;
+  --accent: #c6f36a;
+  --accent-foreground: #172622;
+  --destructive: #b3261e;
+  --success: #2e7d4f;
+  --warning: #946200;
+  --border: #e2e2d6;
+  --input: #d9d9cc;
+  --ring: #171a19;
+  --chart-1: #86b32d;
+  --chart-2: #172622;
+  --chart-3: #b0862b;
+  --chart-4: #5b7263;
+  --chart-5: #a34a2a;
+  --sidebar: #172622;
+  --sidebar-foreground: #dce4d9;
+  --sidebar-primary: #c6f36a;
+  --sidebar-primary-foreground: #172622;
+  --sidebar-accent: #223429;
+  --sidebar-accent-foreground: #e9f0e2;
+  --sidebar-border: #263a2f;
+  --sidebar-ring: #c6f36a;
+}
+
+.dark {
+  --background: #121614;
+  --foreground: #e8ece6;
+  --card: #1a211d;
+  --card-foreground: #e8ece6;
+  --popover: #1a211d;
+  --popover-foreground: #e8ece6;
+  --primary: #e8ece6;
+  --primary-foreground: #121614;
+  --secondary: #222b26;
+  --secondary-foreground: #e8ece6;
+  --muted: #1e2622;
+  --muted-foreground: #97a19a;
+  --accent: #c6f36a;
+  --accent-foreground: #172622;
+  --destructive: #e5484d;
+  --success: #4cae74;
+  --warning: #d9a514;
+  --border: #2a352e;
+  --input: #34403a;
+  --ring: #c6f36a;
+  --chart-1: #c6f36a;
+  --chart-2: #86b32d;
+  --chart-3: #d9a514;
+  --chart-4: #7d9a88;
+  --chart-5: #cd6d4d;
+  --sidebar: #0e1310;
+  --sidebar-foreground: #dce4d9;
+  --sidebar-primary: #c6f36a;
+  --sidebar-primary-foreground: #172622;
+  --sidebar-accent: #1c2b23;
+  --sidebar-accent-foreground: #e9f0e2;
+  --sidebar-border: #22352a;
+  --sidebar-ring: #c6f36a;
+}
+
+@layer base {
+  * {
+    @apply border-border outline-ring/50;
+  }
+  body {
+    @apply bg-background text-foreground;
+    font-feature-settings: "ss01", "cv11";
+  }
+  ::selection {
+    background: #c6f36a;
+    color: #172622;
+  }
+}
+
+/* Thin, unobtrusive scrollbars for long lists */
+.thin-scrollbar {
+  scrollbar-width: thin;
+  scrollbar-color: #c9c9bc transparent;
+}
+.thin-scrollbar::-webkit-scrollbar {
+  width: 6px;
+  height: 6px;
+}
+.thin-scrollbar::-webkit-scrollbar-thumb {
+  background: #c9c9bc;
+  border-radius: 999px;
+}
+.thin-scrollbar::-webkit-scrollbar-track {
+  background: transparent;
+}
+.dark .thin-scrollbar {
+  scrollbar-color: #34403a transparent;
+}
+.dark .thin-scrollbar::-webkit-scrollbar-thumb {
+  background: #34403a;
+}
+
+/* Subtle paper texture grid for empty states / hero areas */
+.bg-grid-paper {
+  background-image:
+    linear-gradient(to right, rgba(23, 26, 25, 0.035) 1px, transparent 1px),
+    linear-gradient(to bottom, rgba(23, 26, 25, 0.035) 1px, transparent 1px);
+  background-size: 28px 28px;
+}
+
+/* Pulsing highlight for detection overlay focus */
+@keyframes docshield-pulse {
+  0%, 100% {
+    box-shadow: 0 0 0 0 rgba(198, 243, 106, 0.7);
+  }
+  50% {
+    box-shadow: 0 0 0 6px rgba(198, 243, 106, 0);
+  }
+}
+.overlay-focus {
+  animation: docshield-pulse 1.2s ease-in-out 2;
+}
+
+/* Monospace fingerprint styling */
+.fingerprint {
+  font-family: var(--font-geist-mono), monospace;
+  font-size: 0.8125rem;
+  letter-spacing: 0.02em;
+  word-break: break-all;
+}

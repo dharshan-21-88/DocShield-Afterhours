@@ -1,13 +1,16 @@
 {
-  "name": "react-example",
+  "name": "docshield-monorepo",
   "private": true,
-  "version": "0.0.0",
+  "version": "1.0.0",
   "type": "module",
   "scripts": {
     "dev": "node server.js",
+    "dev:backend": "node server.js",
+    "dev:frontend": "npm --prefix frontend run dev",
+    "build:frontend": "npm --prefix frontend run build",
     "start": "node server.js",
-    "build": "echo 'Backend-only project: no frontend build required'",
     "test": "node tests/run-tests.js",
+    "test:backend": "node tests/run-tests.js",
     "lint": "node --check server.js"
   },
   "dependencies": {

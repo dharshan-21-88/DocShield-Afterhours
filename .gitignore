@@ -13,3 +13,5 @@ coverage/
 .tmp_samples/
 *.traineddata
 
+.next/
+*.tsbuildinfo
